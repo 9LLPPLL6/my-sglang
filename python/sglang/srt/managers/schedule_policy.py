@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InitLoadBackParams,
     InsertParams,
+    LoadBackOwnership,
     MatchPrefixParams,
     zero_match_result,
 )
@@ -1318,16 +1319,19 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if req.needs_host_load_back():
-                new_indices, req.last_node = self.tree_cache.init_load_back(
+                load_back_result = self.tree_cache.init_load_back_with_ownership(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
                     )
                 )
+                new_indices = load_back_result.device_indices
+                req.last_node = load_back_result.last_node
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
-                req.cache_protected_len = prefix_len
+                if load_back_result.ownership == LoadBackOwnership.TREE:
+                    req.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)

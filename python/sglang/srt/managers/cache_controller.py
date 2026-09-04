@@ -40,7 +40,11 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.l2_transfer import (
+    L2Transfer,
+    L2TransferEngine,
+    StreamingL2Transfer,
+)
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
@@ -55,12 +59,64 @@ class LayerLoadingEvent:
         self._num_layers = num_layers
         self.load_events = [device_module.Event() for _ in range(num_layers)]
         self.start_event = device_module.Event()  # start event on controller stream
+        self._condition = threading.Condition()
+        self._generation = 0
+        self._submitted = [False] * num_layers
 
-    def complete(self, layer_index: int):
+    @property
+    def generation(self) -> int:
+        with self._condition:
+            return self._generation
+
+    def begin_generation(self, generation: int) -> None:
+        """Reset the CPU submission gate before this event slot is reused."""
+        with self._condition:
+            if generation <= self._generation:
+                raise ValueError(
+                    "layer event generation must increase: "
+                    f"current={self._generation}, new={generation}"
+                )
+            self._generation = generation
+            self._submitted = [False] * self._num_layers
+            self._condition.notify_all()
+
+    def complete(self, layer_index: int, *, generation: Optional[int] = None) -> bool:
         assert 0 <= layer_index < self._num_layers
-        self.load_events[layer_index].record()
+        with self._condition:
+            if generation is not None and generation != self._generation:
+                return False
+            self.load_events[layer_index].record()
+            self._submitted[layer_index] = True
+            self._condition.notify_all()
+        return True
 
-    def wait(self, layer_index: int):
+    def wait(
+        self,
+        layer_index: int,
+        *,
+        generation: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> None:
+        assert 0 <= layer_index < self._num_layers
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            expected_generation = self._generation if generation is None else generation
+            while (
+                self._generation == expected_generation
+                and not self._submitted[layer_index]
+            ):
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError(
+                        "timed out waiting for HiCache H2D submission: "
+                        f"generation={expected_generation}, layer={layer_index}"
+                    )
+                self._condition.wait(remaining)
+            if self._generation != expected_generation:
+                raise RuntimeError(
+                    "stale HiCache layer consumer generation: "
+                    f"expected={expected_generation}, current={self._generation}"
+                )
         device_module.current_stream().wait_event(self.load_events[layer_index])
 
     @property
@@ -76,6 +132,8 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        self.producer_generation = 0
+        self.consumer_generation = -1
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -84,19 +142,37 @@ class LayerDoneCounter:
         ].finish_event.query(), (
             "Producer finish event should be ready before being reused."
         )
+        self.producer_generation += 1
+        self.events[self.producer_index].begin_generation(self.producer_generation)
         return self.producer_index
 
-    def set_consumer(self, index: int):
+    def set_consumer(self, index: int, generation: Optional[int] = None):
         self.consumer_index = index
+        if index < 0:
+            self.consumer_generation = -1
+            return
+        if index >= self.num_counters:
+            raise ValueError(
+                f"invalid HiCache consumer index {index}; "
+                f"expected [0, {self.num_counters})"
+            )
+        self.consumer_generation = (
+            self.events[index].generation if generation is None else generation
+        )
 
-    def wait_until(self, threshold: int):
+    def wait_until(self, threshold: int, timeout: Optional[float] = None):
         if self.consumer_index < 0:
             return
-        self.events[self.consumer_index].wait(threshold)
+        self.events[self.consumer_index].wait(
+            threshold,
+            generation=self.consumer_generation,
+            timeout=timeout,
+        )
 
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1
+        self.consumer_generation = -1
 
 
 class CacheOperation:
@@ -187,6 +263,16 @@ class HiCacheAck(NamedTuple):
     # Total bytes moved by the op across all pools, including draft piggyback
     # and sidecar transfers that the per-pool token counts exclude.
     num_bytes: int = 0
+
+
+class StreamingLoadHandle(NamedTuple):
+    """One in-progress layer-group H2D session and its ack bookkeeping."""
+
+    producer_id: int
+    generation: int
+    session: StreamingL2Transfer
+    node_ids: List[int]
+    num_tokens: int
 
 
 @dataclass
@@ -593,7 +679,15 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori"]
+                in [
+                    "hf3fs",
+                    "mooncake",
+                    "eic",
+                    "nixl",
+                    "simm",
+                    "mori",
+                    "layerwise_file",
+                ]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
@@ -941,6 +1035,64 @@ class HiCacheController:
             )
         )
         return producer_id
+
+    def start_streaming_load(
+        self,
+        *,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        node_ids: List[int],
+    ) -> StreamingLoadHandle:
+        """Open a layer-group H2D session for one storage-streamed prefix.
+
+        Unlike ``start_loading``, the caller submits layer ranges as storage
+        makes them available; the model's layer gate is opened range by range
+        instead of all at once.
+        """
+        producer_id = self.layer_done_counter.update_producer()
+        producer_event = self.layer_done_counter.events[producer_id]
+        generation = self.layer_done_counter.producer_generation
+        producer_event.start_event.record()
+        moved_host, moved_device = self.move_indices(host_indices, device_indices)
+        session = self.l2_transfer_engine.begin_host_to_device_streaming(
+            self._l2_load_transfers(moved_host, moved_device, None),
+            layer_num=self.layer_num,
+            start_event=producer_event.start_event,
+        )
+        return StreamingLoadHandle(
+            producer_id=producer_id,
+            generation=generation,
+            session=session,
+            node_ids=list(node_ids),
+            num_tokens=len(device_indices),
+        )
+
+    def submit_streaming_load_range(
+        self, handle: StreamingLoadHandle, *, layer_start: int, layer_end: int
+    ) -> None:
+        producer_event = self.layer_done_counter.events[handle.producer_id]
+        self.l2_transfer_engine.submit_host_to_device_range(
+            handle.session,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            on_layer_done=lambda layer_id: producer_event.complete(
+                layer_id, generation=handle.generation
+            ),
+        )
+
+    def finish_streaming_load(self, handle: StreamingLoadHandle) -> None:
+        completion = self.l2_transfer_engine.finish_host_to_device_streaming(
+            handle.session
+        )
+        self.ack_load_queue.append(
+            HiCacheAck(
+                start_event=completion.start_event,
+                finish_event=completion.finish_event,
+                node_ids=handle.node_ids,
+                num_tokens=handle.num_tokens,
+                timing_enabled=completion.timing_enabled,
+            )
+        )
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)

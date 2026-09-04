@@ -2836,9 +2836,10 @@ class ServerArgs:
     hicache_storage_backend: A[
         Optional[str],
         Arg(
-            help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            help="The storage backend for hierarchical KV cache. Built-in backends: file, layerwise_file, mooncake, hf3fs, nixl, aibrix. layerwise_file reads whole pages with O_DIRECT and Linux AIO and shares its on-disk format with the layerwise streaming tier. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
+                "layerwise_file",
                 "sim",
                 "mooncake",
                 "hf3fs",
@@ -2861,6 +2862,72 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = "timeout"
+    hicache_storage_load_mode: A[
+        str,
+        Arg(
+            help=(
+                "How an L3 storage hit is loaded into the host HiCache tier. "
+                "full_wait preserves the existing behavior and waits for the "
+                "whole prefix; layerwise enables the experimental layer-group "
+                "streaming pipeline."
+            ),
+            choices=["full_wait", "layerwise"],
+        ),
+        NS("memory"),
+    ] = "full_wait"
+    hicache_storage_first_group_layers: A[
+        int,
+        "Number of layers in the admission-critical first storage group when "
+        "--hicache-storage-load-mode=layerwise.",
+        NS("memory"),
+    ] = 1
+    hicache_storage_group_size: A[
+        int,
+        "Number of layers in each steady-state storage group when "
+        "--hicache-storage-load-mode=layerwise.",
+        NS("memory"),
+    ] = 1
+    hicache_storage_read_ahead_groups: A[
+        int,
+        "Maximum number of unretired storage groups in one layerwise read window.",
+        NS("memory"),
+    ] = 1
+    hicache_storage_group_timeout_ms: A[
+        int,
+        "Hard timeout in milliseconds for one layerwise storage group.",
+        NS("memory"),
+    ] = 1000
+    hicache_storage_admission_budget_ms: A[
+        int,
+        "Performance budget in milliseconds for the first layerwise storage "
+        "group. Zero explicitly disables this performance gate; it does not "
+        "select an automatic budget.",
+        NS("memory"),
+    ] = 0
+    hicache_storage_max_inflight_bytes: A[
+        int,
+        Arg(
+            help=(
+                "Maximum total bytes held by in-flight layerwise storage reads."
+                + f"\n\n{human_readable_int.__doc__}"
+            ),
+            type_parser=human_readable_int,
+        ),
+        NS("memory"),
+    ] = (
+        1 << 30
+    )
+    hicache_storage_slow_fallback: A[
+        str,
+        Arg(
+            help=(
+                "Fallback used when an admission-critical layerwise read exceeds "
+                "its performance budget."
+            ),
+            choices=["full_wait", "recompute"],
+        ),
+        NS("memory"),
+    ] = "full_wait"
     hicache_storage_backend_extra_config: A[
         Optional[str],
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
@@ -3867,6 +3934,7 @@ class ServerArgs:
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
+        self._validate_hicache_storage_load_config()
         self._validate_prefill_decode_interval()
 
         # Reject an explicitly enabled but incompatible hardware runtime before
@@ -8147,6 +8215,7 @@ class ServerArgs:
         2) Storage <-> layout compatibility (may rewrite layout).
         """
         cfg = resolving_view(self)
+        self._validate_hicache_storage_load_config()
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
             cfg.enable_hierarchical_cache
@@ -8166,8 +8235,120 @@ class ServerArgs:
         # Step 2: Storage-layout normalization without changing io backend.
         self._resolve_storage_layout_compatibility()
 
-        # Step 3: DCP compatibility for the L2 (device<->host) path.
+        # Step 3: The experimental storage-streaming path has a deliberately
+        # narrow support matrix. Validate after layout/I/O normalization so
+        # compatible aliases resolve before the fail-closed check.
+        self._validate_hicache_layerwise_compatibility()
+
+        # Step 4: DCP compatibility for the L2 (device<->host) path.
         self._resolve_hicache_dcp_compatibility()
+
+    def _validate_hicache_storage_load_config(self):
+        """Validate opt-in storage streaming knobs without touching defaults.
+
+        ``full_wait`` is the compatibility gate: when selected, every new
+        layerwise-only knob is dormant and the pre-existing HiCache behavior is
+        unchanged. The basic layerwise checks run before the dummy-model
+        boundary so malformed opt-in configurations fail before model loading.
+        """
+        cfg = resolving_view(self)
+        if cfg.hicache_storage_load_mode == "full_wait":
+            return
+        if cfg.hicache_storage_load_mode != "layerwise":
+            raise ValueError(
+                "--hicache-storage-load-mode must be 'full_wait' or 'layerwise', "
+                f"got {cfg.hicache_storage_load_mode!r}."
+            )
+
+        positive_fields = (
+            (
+                "--hicache-storage-first-group-layers",
+                cfg.hicache_storage_first_group_layers,
+            ),
+            ("--hicache-storage-group-size", cfg.hicache_storage_group_size),
+            (
+                "--hicache-storage-read-ahead-groups",
+                cfg.hicache_storage_read_ahead_groups,
+            ),
+            (
+                "--hicache-storage-group-timeout-ms",
+                cfg.hicache_storage_group_timeout_ms,
+            ),
+            (
+                "--hicache-storage-max-inflight-bytes",
+                cfg.hicache_storage_max_inflight_bytes,
+            ),
+        )
+        for name, value in positive_fields:
+            if value < 1:
+                raise ValueError(f"{name} must be >= 1, got {value}.")
+        if cfg.hicache_storage_admission_budget_ms < 0:
+            raise ValueError(
+                "--hicache-storage-admission-budget-ms must be >= 0 (zero "
+                "disables the performance gate), got "
+                f"{cfg.hicache_storage_admission_budget_ms}."
+            )
+        if cfg.hicache_storage_slow_fallback not in ("full_wait", "recompute"):
+            raise ValueError(
+                "--hicache-storage-slow-fallback must be 'full_wait' or "
+                f"'recompute', got {cfg.hicache_storage_slow_fallback!r}."
+            )
+        if not cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "--hicache-storage-load-mode=layerwise requires "
+                "--enable-hierarchical-cache."
+            )
+        if cfg.hicache_storage_backend is None:
+            raise ValueError(
+                "--hicache-storage-load-mode=layerwise requires "
+                "--hicache-storage-backend."
+            )
+
+    def _validate_hicache_layerwise_compatibility(self):
+        """Fail closed for combinations the first layerwise implementation lacks."""
+        cfg = resolving_view(self)
+        if cfg.hicache_storage_load_mode != "layerwise":
+            return
+
+        required_values = (
+            ("--hicache-host-memory-mode", cfg.hicache_host_memory_mode, "cache"),
+            ("--hicache-io-backend", cfg.hicache_io_backend, "direct"),
+            (
+                "--hicache-mem-layout",
+                cfg.hicache_mem_layout,
+                "page_first_direct",
+            ),
+            (
+                "--hicache-write-policy",
+                cfg.hicache_write_policy,
+                "write_through",
+            ),
+        )
+        for name, value, required in required_values:
+            if value != required:
+                raise ValueError(
+                    "--hicache-storage-load-mode=layerwise requires "
+                    f"{name}={required}, got {value!r}."
+                )
+
+        unsupported = (
+            (not cfg.disable_overlap_schedule, "--disable-overlap-schedule"),
+            (cfg.chunked_prefill_size != -1, "--chunked-prefill-size=-1"),
+            (cfg.speculative_algorithm is not None, "speculative decoding disabled"),
+            (cfg.pp_size != 1, "--pp-size=1"),
+            (cfg.dp_size != 1, "--dp-size=1"),
+            (cfg.dcp_size != 1, "--dcp-size=1"),
+            (cfg.attn_cp_size != 1, "--attn-cp-size=1"),
+            (cfg.enable_prefill_cp, "prefill context parallelism disabled"),
+            (cfg.disaggregation_mode != "null", "--disaggregation-mode=null"),
+            (cfg.device != "cuda", "--device=cuda"),
+        )
+        for incompatible, requirement in unsupported:
+            if incompatible:
+                raise ValueError(
+                    "--hicache-storage-load-mode=layerwise currently requires "
+                    f"{requirement}."
+                )
 
     def _validate_hicache_host_memory_mode(self):
         cfg = resolving_view(self)

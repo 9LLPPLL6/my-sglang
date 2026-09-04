@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Sequence
+from typing import NamedTuple, Sequence
 
 import torch
 
@@ -64,6 +64,160 @@ if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
 logger = logging.getLogger(__name__)
+
+
+class LayerGroupBufferExtent(NamedTuple):
+    """One K/V layer-group extent in a page-major host buffer.
+
+    ``covering_file_offset`` and ``covering_size`` describe an aligned file
+    read into a separate bounce buffer.  A caller must copy exactly
+    ``logical_size`` bytes starting at ``bounce_data_offset`` into
+    ``logical_ptr``; the covering range must never be read directly into the
+    compact host slice because it may include bytes from adjacent layers.
+    """
+
+    page_index: int
+    kv: str
+    logical_ptr: int
+    logical_size: int
+    buffer_base_ptr: int
+    buffer_offset: int
+    logical_file_offset: int
+    layer_stride: int
+    page_stride: int
+    base_aligned: bool
+    buffer_offset_aligned: bool
+    host_address_aligned: bool
+    file_offset_aligned: bool
+    length_aligned: bool
+    layer_stride_aligned: bool
+    page_stride_aligned: bool
+    direct_io_eligible: bool
+    covering_file_offset: int
+    covering_size: int
+    bounce_data_offset: int
+    bounce_required: bool
+
+
+class LayerGroupBufferPlan(NamedTuple):
+    """K/V extents and alignment facts for one inclusive-exclusive layer range."""
+
+    layer_start: int
+    layer_end: int
+    alignment: int
+    file_payload_offset: int
+    extents: tuple[LayerGroupBufferExtent, ...]
+    total_logical_size: int
+    direct_io_eligible: bool
+    bounce_required: bool
+
+
+def _align_down(value: int, alignment: int) -> int:
+    return value // alignment * alignment
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _validate_layer_group_host_indices(
+    host_indices: torch.Tensor, *, page_size: int, page_num: int
+) -> list[int]:
+    if not isinstance(host_indices, torch.Tensor):
+        raise TypeError("host_indices must be a torch.Tensor")
+    if host_indices.dim() != 1:
+        raise ValueError("host_indices must be one-dimensional")
+    if len(host_indices) % page_size != 0:
+        raise ValueError(
+            f"host_indices length must be a multiple of page_size={page_size}"
+        )
+
+    raw_indices = host_indices.tolist()
+    if any(
+        isinstance(index, bool) or not isinstance(index, int) for index in raw_indices
+    ):
+        raise TypeError("host_indices must contain integers")
+
+    page_indices = []
+    for offset in range(0, len(raw_indices), page_size):
+        page_tokens = raw_indices[offset : offset + page_size]
+        first_token = page_tokens[0]
+        if first_token % page_size != 0:
+            raise ValueError(
+                f"host page must start at a page-aligned token index, got {first_token}"
+            )
+        if page_tokens != list(range(first_token, first_token + page_size)):
+            raise ValueError(
+                "each host page must contain contiguous token indices in "
+                "ascending order"
+            )
+        page_index = first_token // page_size
+        if page_index < 0 or page_index >= page_num:
+            raise ValueError(f"host page index {page_index} is outside [0, {page_num})")
+        page_indices.append(page_index)
+    return page_indices
+
+
+def _validate_page_first_direct_buffer(
+    kv: str, buffer: torch.Tensor, expected_prefix: tuple[int, int, int, int]
+) -> None:
+    if buffer.dim() != 5 or tuple(buffer.shape[:4]) != expected_prefix:
+        raise ValueError(
+            f"{kv} buffer shape is incompatible with page_first_direct: "
+            f"expected prefix {expected_prefix}, got {tuple(buffer.shape)}"
+        )
+    if not buffer.is_contiguous():
+        raise ValueError(f"{kv} page_first_direct buffer must be contiguous")
+
+
+def _build_layer_group_extent(
+    *,
+    kv: str,
+    buffer: torch.Tensor,
+    page_index: int,
+    layer_start: int,
+    layer_end: int,
+    file_region_offset: int,
+    alignment: int,
+) -> LayerGroupBufferExtent:
+    element_size = buffer.element_size()
+    layer_stride = buffer.stride(1) * element_size
+    page_stride = buffer.stride(0) * element_size
+    logical_size = (layer_end - layer_start) * layer_stride
+    buffer_offset = page_index * page_stride + layer_start * layer_stride
+    logical_ptr = buffer.data_ptr() + buffer_offset
+    logical_file_offset = file_region_offset + layer_start * layer_stride
+    covering_file_offset = _align_down(logical_file_offset, alignment)
+    bounce_data_offset = logical_file_offset - covering_file_offset
+    covering_size = _align_up(bounce_data_offset + logical_size, alignment)
+
+    host_address_aligned = logical_ptr % alignment == 0
+    file_offset_aligned = logical_file_offset % alignment == 0
+    length_aligned = logical_size % alignment == 0
+    direct_io_eligible = host_address_aligned and file_offset_aligned and length_aligned
+    return LayerGroupBufferExtent(
+        page_index=page_index,
+        kv=kv,
+        logical_ptr=logical_ptr,
+        logical_size=logical_size,
+        buffer_base_ptr=buffer.data_ptr(),
+        buffer_offset=buffer_offset,
+        logical_file_offset=logical_file_offset,
+        layer_stride=layer_stride,
+        page_stride=page_stride,
+        base_aligned=buffer.data_ptr() % alignment == 0,
+        buffer_offset_aligned=buffer_offset % alignment == 0,
+        host_address_aligned=host_address_aligned,
+        file_offset_aligned=file_offset_aligned,
+        length_aligned=length_aligned,
+        layer_stride_aligned=layer_stride % alignment == 0,
+        page_stride_aligned=page_stride % alignment == 0,
+        direct_io_eligible=direct_io_eligible,
+        covering_file_offset=covering_file_offset,
+        covering_size=covering_size,
+        bounce_data_offset=bounce_data_offset,
+        bounce_required=not direct_io_eligible,
+    )
 
 
 class MHATokenToKVPoolHost(HostKVCache):
@@ -666,6 +820,111 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+    def get_layer_group_buffer_meta(
+        self,
+        host_indices: torch.Tensor,
+        layer_start: int,
+        layer_end: int,
+        *,
+        file_payload_offset: int = 0,
+        alignment: int = 4096,
+    ) -> LayerGroupBufferPlan:
+        """Plan per-page K/V I/O for ``[layer_start, layer_end)``.
+
+        File offsets describe a compact per-page payload laid out as
+        ``[K all layers][V all layers]``.  ``file_payload_offset`` is the
+        aligned header/slot prefix before that payload.  The host pointers
+        refer to this rank's local-head shard, so the calculation naturally
+        supports MHA/GQA under TP.
+
+        For an unaligned extent, the returned covering range is intended for
+        an independently allocated aligned bounce buffer.  This method never
+        mutates the host KV buffer and never treats padding as host capacity.
+        """
+        if self.layout != "page_first_direct":
+            raise ValueError(
+                "layer-group buffer metadata requires layout='page_first_direct', "
+                f"got {self.layout!r}"
+            )
+        if (
+            isinstance(layer_start, bool)
+            or isinstance(layer_end, bool)
+            or not isinstance(layer_start, int)
+            or not isinstance(layer_end, int)
+        ):
+            raise TypeError("layer_start and layer_end must be integers")
+        if not 0 <= layer_start < layer_end <= self.layer_num:
+            raise ValueError(
+                "layer range must satisfy "
+                f"0 <= layer_start < layer_end <= {self.layer_num}, got "
+                f"[{layer_start}, {layer_end})"
+            )
+        if (
+            isinstance(alignment, bool)
+            or not isinstance(alignment, int)
+            or alignment <= 0
+        ):
+            raise ValueError(f"alignment must be a positive integer, got {alignment!r}")
+        if (
+            isinstance(file_payload_offset, bool)
+            or not isinstance(file_payload_offset, int)
+            or file_payload_offset < 0
+        ):
+            raise ValueError(
+                "file_payload_offset must be a non-negative integer, got "
+                f"{file_payload_offset!r}"
+            )
+
+        page_indices = _validate_layer_group_host_indices(
+            host_indices, page_size=self.page_size, page_num=self.page_num
+        )
+        buffers = (("K", self.k_buffer), ("V", self.v_buffer))
+        expected_prefix = (
+            self.page_num,
+            self.layer_num,
+            self.page_size,
+            self.head_num,
+        )
+        for kv, buffer in buffers:
+            _validate_page_first_direct_buffer(kv, buffer, expected_prefix)
+
+        file_region_offsets: dict[str, int] = {}
+        next_file_offset = file_payload_offset
+        for kv, buffer in buffers:
+            layer_stride = buffer.stride(1) * buffer.element_size()
+            file_region_offsets[kv] = next_file_offset
+            next_file_offset += self.layer_num * layer_stride
+
+        extents = []
+        for page_index in page_indices:
+            for kv, buffer in buffers:
+                extents.append(
+                    _build_layer_group_extent(
+                        kv=kv,
+                        buffer=buffer,
+                        page_index=page_index,
+                        layer_start=layer_start,
+                        layer_end=layer_end,
+                        file_region_offset=file_region_offsets[kv],
+                        alignment=alignment,
+                    )
+                )
+
+        extent_tuple = tuple(extents)
+        direct_io_eligible = bool(extent_tuple) and all(
+            extent.direct_io_eligible for extent in extent_tuple
+        )
+        return LayerGroupBufferPlan(
+            layer_start=layer_start,
+            layer_end=layer_end,
+            alignment=alignment,
+            file_payload_offset=file_payload_offset,
+            extents=extent_tuple,
+            total_logical_size=sum(extent.logical_size for extent in extent_tuple),
+            direct_io_eligible=direct_io_eligible,
+            bounce_required=any(extent.bounce_required for extent in extent_tuple),
+        )
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         """Return True if per-page strides are multiples of *page_size_bytes*.

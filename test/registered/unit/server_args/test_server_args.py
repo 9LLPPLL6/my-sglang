@@ -1517,6 +1517,215 @@ class TestHiCacheArgs(unittest.TestCase):
         args._handle_cache_compatibility()
 
 
+class TestLayerwiseHiCacheArgs(CustomTestCase):
+    @staticmethod
+    def _valid_layerwise_overrides(**overrides):
+        values = {
+            "enable_hierarchical_cache": True,
+            "hicache_storage_backend": "sim",
+            "hicache_storage_load_mode": "layerwise",
+            "hicache_host_memory_mode": "cache",
+            "hicache_io_backend": "direct",
+            "hicache_mem_layout": "page_first_direct",
+            "hicache_write_policy": "write_through",
+            "disable_overlap_schedule": True,
+            "chunked_prefill_size": -1,
+            "speculative_algorithm": None,
+            "pp_size": 1,
+            "dp_size": 1,
+            "dcp_size": 1,
+            "attn_cp_size": 1,
+            "enable_prefill_cp": False,
+            "disaggregation_mode": "null",
+            "device": "cuda",
+        }
+        values.update(overrides)
+        return values
+
+    def _make_args(self, **overrides) -> ServerArgs:
+        args = ServerArgs(model_path="dummy", **overrides)
+        args._handle_hicache_ratio_default()
+        return args
+
+    def test_cli_defaults_preserve_full_wait_behavior(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(["--model-path", "dummy"])
+
+        self.assertEqual(parsed.hicache_storage_load_mode, "full_wait")
+        self.assertEqual(parsed.hicache_storage_first_group_layers, 1)
+        self.assertEqual(parsed.hicache_storage_group_size, 1)
+        self.assertEqual(parsed.hicache_storage_read_ahead_groups, 1)
+        self.assertEqual(parsed.hicache_storage_group_timeout_ms, 1000)
+        self.assertEqual(parsed.hicache_storage_admission_budget_ms, 0)
+        self.assertEqual(parsed.hicache_storage_max_inflight_bytes, 1 << 30)
+        self.assertEqual(parsed.hicache_storage_slow_fallback, "full_wait")
+
+    def test_cli_parses_layerwise_knobs(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(
+            [
+                "--model-path",
+                "dummy",
+                "--hicache-storage-load-mode",
+                "layerwise",
+                "--hicache-storage-first-group-layers",
+                "1",
+                "--hicache-storage-group-size",
+                "4",
+                "--hicache-storage-read-ahead-groups",
+                "2",
+                "--hicache-storage-group-timeout-ms",
+                "2500",
+                "--hicache-storage-admission-budget-ms",
+                "25",
+                "--hicache-storage-max-inflight-bytes",
+                "512Mi",
+                "--hicache-storage-slow-fallback",
+                "recompute",
+            ]
+        )
+
+        self.assertEqual(parsed.hicache_storage_load_mode, "layerwise")
+        self.assertEqual(parsed.hicache_storage_first_group_layers, 1)
+        self.assertEqual(parsed.hicache_storage_group_size, 4)
+        self.assertEqual(parsed.hicache_storage_read_ahead_groups, 2)
+        self.assertEqual(parsed.hicache_storage_group_timeout_ms, 2500)
+        self.assertEqual(parsed.hicache_storage_admission_budget_ms, 25)
+        self.assertEqual(parsed.hicache_storage_max_inflight_bytes, 512 << 20)
+        self.assertEqual(parsed.hicache_storage_slow_fallback, "recompute")
+
+    def test_full_wait_does_not_activate_layerwise_validation(self):
+        args = self._make_args(
+            hicache_storage_load_mode="full_wait",
+            hicache_storage_first_group_layers=0,
+            hicache_storage_group_size=0,
+            hicache_storage_read_ahead_groups=0,
+            hicache_storage_group_timeout_ms=0,
+            hicache_storage_admission_budget_ms=-1,
+            hicache_storage_max_inflight_bytes=0,
+            hicache_storage_slow_fallback="not-used",
+        )
+
+        args._handle_hicache()
+
+    def test_valid_layerwise_config_and_disabled_admission_budget(self):
+        args = self._make_args(
+            **self._valid_layerwise_overrides(
+                hicache_storage_first_group_layers=1,
+                hicache_storage_group_size=4,
+                hicache_storage_read_ahead_groups=2,
+                hicache_storage_group_timeout_ms=2500,
+                hicache_storage_admission_budget_ms=0,
+                hicache_storage_max_inflight_bytes=512 << 20,
+                hicache_storage_slow_fallback="recompute",
+            )
+        )
+
+        args._handle_hicache()
+
+        self.assertEqual(
+            resolution_result(args, "hicache_storage_load_mode"), "layerwise"
+        )
+        self.assertEqual(
+            resolution_result(args, "hicache_storage_admission_budget_ms"), 0
+        )
+
+    def test_direct_page_first_alias_is_normalized_before_validation(self):
+        args = self._make_args(
+            **self._valid_layerwise_overrides(hicache_mem_layout="page_first")
+        )
+
+        args._handle_hicache()
+
+        self.assertEqual(
+            resolution_result(args, "hicache_mem_layout"), "page_first_direct"
+        )
+
+    def test_layerwise_numeric_bounds_fail_fast(self):
+        cases = (
+            ("hicache_storage_first_group_layers", 0, "first-group-layers"),
+            ("hicache_storage_group_size", 0, "group-size"),
+            ("hicache_storage_read_ahead_groups", 0, "read-ahead-groups"),
+            ("hicache_storage_group_timeout_ms", 0, "group-timeout-ms"),
+            ("hicache_storage_admission_budget_ms", -1, "admission-budget-ms"),
+            ("hicache_storage_max_inflight_bytes", 0, "max-inflight-bytes"),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field):
+                args = self._make_args(
+                    **self._valid_layerwise_overrides(**{field: value})
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    args._handle_hicache()
+
+    def test_layerwise_direct_constructor_rejects_unknown_enums(self):
+        args = self._make_args(hicache_storage_load_mode="stream-everything")
+        with self.assertRaisesRegex(ValueError, "full_wait.*layerwise"):
+            args._handle_hicache()
+
+        args = self._make_args(
+            **self._valid_layerwise_overrides(
+                hicache_storage_slow_fallback="retry-forever"
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "slow-fallback"):
+            args._handle_hicache()
+
+    def test_layerwise_requires_hicache_and_storage(self):
+        without_hicache = self._valid_layerwise_overrides()
+        without_hicache["enable_hierarchical_cache"] = False
+        args = self._make_args(**without_hicache)
+        with self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"):
+            args._handle_hicache()
+
+        args = self._make_args(
+            **self._valid_layerwise_overrides(hicache_storage_backend=None)
+        )
+        with self.assertRaisesRegex(ValueError, "hicache-storage-backend"):
+            args._handle_hicache()
+
+    def test_kernel_io_backend_alias_is_normalized_before_validation(self):
+        """``kernel`` + ``page_first_direct`` is rewritten to ``direct`` upstream.
+
+        The layerwise fail-closed check deliberately runs after I/O/layout
+        normalization, so this combination must resolve instead of raising.
+        """
+        args = self._make_args(
+            **self._valid_layerwise_overrides(hicache_io_backend="kernel")
+        )
+
+        args._handle_hicache()
+
+        self.assertEqual(resolution_result(args, "hicache_io_backend"), "direct")
+
+    def test_layerwise_support_matrix_fails_closed(self):
+        cases = (
+            ("hicache_host_memory_mode", "buffer_only", "host-memory-mode=cache"),
+            ("hicache_io_backend", "kernel_ascend", "io-backend=direct"),
+            ("hicache_mem_layout", "layer_first", "mem-layout=page_first_direct"),
+            ("hicache_write_policy", "write_back", "write-policy=write_through"),
+            ("disable_overlap_schedule", False, "disable-overlap-schedule"),
+            ("chunked_prefill_size", 32, "chunked-prefill-size=-1"),
+            ("speculative_algorithm", "EAGLE", "speculative decoding disabled"),
+            ("pp_size", 2, "pp-size=1"),
+            ("dp_size", 2, "dp-size=1"),
+            ("dcp_size", 2, "dcp-size=1"),
+            ("attn_cp_size", 2, "attn-cp-size=1"),
+            ("enable_prefill_cp", True, "prefill context parallelism disabled"),
+            ("disaggregation_mode", "prefill", "disaggregation-mode=null"),
+            ("device", "cpu", "device=cuda"),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field):
+                args = self._make_args(
+                    **self._valid_layerwise_overrides(**{field: value})
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    args._handle_hicache()
+
+
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):
         args = ServerArgs(model_path="dummy")

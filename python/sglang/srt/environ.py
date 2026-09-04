@@ -701,6 +701,16 @@ class Envs:
     # consumption so eviction cannot waste the fetch; cap = fraction of pool.
     SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK = EnvBool(False)
     SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP = EnvFloat(0.5)
+    # Root directory of the layerwise (L2/L3 fused) page-file storage tier;
+    # also settable per deployment via the "layerwise_root" key in
+    # --hicache-storage-backend-extra-config, which takes precedence.
+    SGLANG_HICACHE_LAYERWISE_ROOT = EnvStr("/tmp/sglang-hicache-l3")
+    # Byte cap on the layerwise page store; empty or "0" means unlimited.
+    SGLANG_HICACHE_LAYERWISE_MAX_SIZE = EnvStr(None)
+    # Free space the layerwise page store refuses to consume. Non-zero by
+    # default: a lost cache page costs a recompute, a full device costs the
+    # server. Sizes accept SI/IEC suffixes; "0" disables the watermark.
+    SGLANG_HICACHE_LAYERWISE_MIN_FREE_SPACE = EnvStr("8Gi")
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

@@ -7,7 +7,12 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
+from sglang.srt.managers import cache_controller as cache_controller_module
+from sglang.srt.managers.cache_controller import (
+    CacheOperation,
+    HiCacheController,
+    LayerDoneCounter,
+)
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -176,13 +181,25 @@ class _FakeEvent:
     def wait(self, stream):
         pass
 
+    def query(self):
+        return True
+
+
+class _FakeStream:
+    def wait_event(self, event):
+        pass
+
 
 class _FakeDeviceModule:
     Event = _FakeEvent
 
     @staticmethod
     def Stream():
-        return object()
+        return _FakeStream()
+
+    @staticmethod
+    def current_stream():
+        return _FakeStream()
 
     @staticmethod
     @contextmanager
@@ -280,6 +297,88 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             ],
             [0, 1],
         )
+
+    def test_l2_transfer_streaming_submits_ordered_ranges(self):
+        host_pool = mock.Mock()
+        transfer = L2Transfer(
+            host_pool=host_pool,
+            device_pool=mock.sentinel.device_pool,
+            host_indices=_indices(0, 2),
+            device_indices=_indices(2, 4),
+        )
+        completed_layers = []
+
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            engine = L2TransferEngine("direct")
+            session = engine.begin_host_to_device_streaming([transfer], layer_num=4)
+            engine.submit_host_to_device_range(
+                session,
+                layer_start=0,
+                layer_end=1,
+                on_layer_done=completed_layers.append,
+            )
+            engine.submit_host_to_device_range(
+                session,
+                layer_start=1,
+                layer_end=4,
+                on_layer_done=completed_layers.append,
+            )
+            completion = engine.finish_host_to_device_streaming(session)
+
+        self.assertEqual(completed_layers, [0, 1, 2, 3])
+        self.assertEqual(
+            [
+                call.args[3]
+                for call in host_pool.load_to_device_per_layer.call_args_list
+            ],
+            [0, 1, 2, 3],
+        )
+        self.assertIs(completion.start_event, session.start_event)
+        self.assertIs(completion.finish_event, session.finish_event)
+        self.assertTrue(session.closed)
+
+    def test_l2_transfer_streaming_rejects_gaps_and_early_finish(self):
+        transfer = L2Transfer(
+            host_pool=mock.Mock(),
+            device_pool=mock.sentinel.device_pool,
+            host_indices=_indices(0, 2),
+            device_indices=_indices(2, 4),
+        )
+
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            engine = L2TransferEngine("direct")
+            session = engine.begin_host_to_device_streaming([transfer], layer_num=4)
+            with self.assertRaisesRegex(ValueError, "contiguous and ordered"):
+                engine.submit_host_to_device_range(session, layer_start=1, layer_end=2)
+            engine.submit_host_to_device_range(session, layer_start=0, layer_end=2)
+            with self.assertRaisesRegex(RuntimeError, "before every layer"):
+                engine.finish_host_to_device_streaming(session)
+            engine.submit_host_to_device_range(session, layer_start=2, layer_end=4)
+            engine.finish_host_to_device_streaming(session)
+            with self.assertRaisesRegex(RuntimeError, "already closed"):
+                engine.submit_host_to_device_range(session, layer_start=4, layer_end=4)
+
+    def test_layer_done_counter_rejects_stale_generation(self):
+        with mock.patch.object(
+            cache_controller_module, "device_module", _FakeDeviceModule
+        ):
+            counter = LayerDoneCounter(num_layers=2)
+            producer_index = counter.update_producer()
+            generation = counter.producer_generation
+            counter.set_consumer(producer_index, generation)
+
+            self.assertFalse(
+                counter.events[producer_index].complete(0, generation=generation - 1)
+            )
+            with self.assertRaisesRegex(TimeoutError, "H2D submission"):
+                counter.wait_until(0, timeout=0.001)
+
+            self.assertTrue(
+                counter.events[producer_index].complete(0, generation=generation)
+            )
+            counter.wait_until(0, timeout=0.001)
+            counter.set_consumer(-1)
+            counter.wait_until(1, timeout=0.001)
 
     def test_packed_draft_load_is_flattened_into_l2_transfers(self):
         host_pool = mock.Mock()

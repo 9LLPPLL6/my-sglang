@@ -23,6 +23,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_exec,
     get_flags,
+    get_memory,
     get_parallel,
     get_server_args,
     max_speculative_num_draft_tokens,
@@ -253,6 +254,50 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         reset_context()
         with self.assertRaises(ValueError):
             get_server_args()
+
+
+class TestLayerwiseHiCacheMemoryConfig(_IsolatedServerArgs):
+    def test_defaults_are_projected_into_memory_namespace(self):
+        args = ServerArgs(model_path="dummy")
+        args.resolve_once()
+        get_context().set_server_args(args)
+
+        memory = get_memory()
+        self.assertEqual(memory.hicache_storage_load_mode, "full_wait")
+        self.assertEqual(memory.hicache_storage_first_group_layers, 1)
+        self.assertEqual(memory.hicache_storage_group_size, 1)
+        self.assertEqual(memory.hicache_storage_read_ahead_groups, 1)
+        self.assertEqual(memory.hicache_storage_group_timeout_ms, 1000)
+        self.assertEqual(memory.hicache_storage_admission_budget_ms, 0)
+        self.assertEqual(memory.hicache_storage_max_inflight_bytes, 1 << 30)
+        self.assertEqual(memory.hicache_storage_slow_fallback, "full_wait")
+
+    def test_layerwise_values_are_projected_into_memory_namespace(self):
+        args = ServerArgs(
+            model_path="dummy",
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="sim",
+            hicache_storage_load_mode="layerwise",
+            hicache_storage_first_group_layers=1,
+            hicache_storage_group_size=4,
+            hicache_storage_read_ahead_groups=2,
+            hicache_storage_group_timeout_ms=2500,
+            hicache_storage_admission_budget_ms=0,
+            hicache_storage_max_inflight_bytes=512 << 20,
+            hicache_storage_slow_fallback="recompute",
+        )
+        args.resolve_once()
+        get_context().set_server_args(args)
+
+        memory = get_memory()
+        self.assertEqual(memory.hicache_storage_load_mode, "layerwise")
+        self.assertEqual(memory.hicache_storage_first_group_layers, 1)
+        self.assertEqual(memory.hicache_storage_group_size, 4)
+        self.assertEqual(memory.hicache_storage_read_ahead_groups, 2)
+        self.assertEqual(memory.hicache_storage_group_timeout_ms, 2500)
+        self.assertEqual(memory.hicache_storage_admission_budget_ms, 0)
+        self.assertEqual(memory.hicache_storage_max_inflight_bytes, 512 << 20)
+        self.assertEqual(memory.hicache_storage_slow_fallback, "recompute")
 
 
 class TestAssertPublished(_IsolatedServerArgs):

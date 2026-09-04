@@ -189,6 +189,8 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "shm":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "layerwise_file":
+            return backend_class(storage_config, mem_pool_host)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -248,4 +250,10 @@ StorageBackendFactory.register_backend(
     "shm",
     "sglang.srt.mem_cache.storage.shm",
     "HiCacheShm",
+)
+
+StorageBackendFactory.register_backend(
+    "layerwise_file",
+    "sglang.srt.mem_cache.storage.layerwise.hicache_layerwise_file",
+    "HiCacheLayerwiseFile",
 )

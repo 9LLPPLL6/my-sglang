@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -166,6 +167,19 @@ class InitLoadBackParams:
     host_hit_length: int
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
+
+
+class LoadBackOwnership(str, Enum):
+    """Owner of device slots returned by a HiCache load-back operation."""
+
+    TREE = "tree"
+    REQUEST = "request"
+
+
+class InitLoadBackResult(NamedTuple):
+    device_indices: torch.Tensor
+    last_node: Any
+    ownership: LoadBackOwnership = LoadBackOwnership.TREE
 
 
 class MatchResult(NamedTuple):
@@ -376,6 +390,24 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Preparing KV cache loading from host to device.
         """
         raise NotImplementedError()
+
+    def init_load_back_with_ownership(
+        self,
+        params: InitLoadBackParams,
+    ) -> InitLoadBackResult:
+        """Load host KV while preserving the legacy two-value backend API.
+
+        Existing cache backends publish their returned slots into the radix
+        tree during load-back.  A layerwise storage pipeline can override this
+        narrow method and return ``REQUEST`` ownership until its transaction is
+        committed, without changing legacy callers of ``init_load_back``.
+        """
+        device_indices, last_node = self.init_load_back(params)
+        return InitLoadBackResult(
+            device_indices=device_indices,
+            last_node=last_node,
+            ownership=LoadBackOwnership.TREE,
+        )
 
     def ready_to_load_host_cache(self) -> Any:
         """
