@@ -51,6 +51,11 @@ from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
 
+# How long a streaming layer gate sleeps between pump attempts. Small enough to
+# not add measurable latency to a fast storage read, large enough not to burn a
+# core spinning while the device works.
+_STREAM_PUMP_IDLE_S = 0.0005
+
 device_module = get_device_module()
 
 
@@ -96,7 +101,16 @@ class LayerLoadingEvent:
         *,
         generation: Optional[int] = None,
         timeout: Optional[float] = None,
+        pump=None,
     ) -> None:
+        """Block until this layer's H2D is submitted, then gate the GPU on it.
+
+        ``pump`` exists for the storage-streaming path, where the submission
+        this call waits for is produced by the *same* thread: the model forward
+        runs on the scheduler thread, so without draining the pipeline from
+        inside the wait, nothing would ever submit the layer and the wait would
+        deadlock instead of progressing.
+        """
         assert 0 <= layer_index < self._num_layers
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._condition:
@@ -111,6 +125,14 @@ class LayerLoadingEvent:
                         "timed out waiting for HiCache H2D submission: "
                         f"generation={expected_generation}, layer={layer_index}"
                     )
+                if pump is not None:
+                    pump()
+                    if self._submitted[layer_index]:
+                        break
+                    # Yield briefly instead of spinning: the next completion
+                    # comes from a device, not from another thread.
+                    self._condition.wait(_STREAM_PUMP_IDLE_S)
+                    continue
                 self._condition.wait(remaining)
             if self._generation != expected_generation:
                 raise RuntimeError(
@@ -134,6 +156,8 @@ class LayerDoneCounter:
         self.consumer_index = -1
         self.producer_generation = 0
         self.consumer_generation = -1
+        # Set only while a storage-streaming load is open; see LayerLoadingEvent.wait.
+        self.stream_pump = None
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -167,12 +191,14 @@ class LayerDoneCounter:
             threshold,
             generation=self.consumer_generation,
             timeout=timeout,
+            pump=self.stream_pump,
         )
 
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1
         self.consumer_generation = -1
+        self.stream_pump = None
 
 
 class CacheOperation:
@@ -1054,8 +1080,26 @@ class HiCacheController:
         generation = self.layer_done_counter.producer_generation
         producer_event.start_event.record()
         moved_host, moved_device = self.move_indices(host_indices, device_indices)
+        transfers = self._l2_load_transfers(moved_host, moved_device, None)
+
+        # A batch carries one consumer index, so an ordinary load-back queued
+        # by another request in the same batch has to ride this session; a
+        # second producer would leave that request's layers ungated. Its host
+        # data is already complete, so its layers simply move with ours.
+        merged_node_ids = list(node_ids)
+        merged_tokens = len(device_indices)
+        if self.load_queue:
+            queued = CacheOperation.merge_ops(self.load_queue)
+            self.load_queue.clear()
+            queued_host, queued_device, queued_pools = self._move_op_indices(queued)
+            transfers.extend(
+                self._l2_load_transfers(queued_host, queued_device, queued_pools)
+            )
+            merged_node_ids.extend(queued.node_ids)
+            merged_tokens += len(queued.device_indices)
+
         session = self.l2_transfer_engine.begin_host_to_device_streaming(
-            self._l2_load_transfers(moved_host, moved_device, None),
+            transfers,
             layer_num=self.layer_num,
             start_event=producer_event.start_event,
         )
@@ -1063,8 +1107,8 @@ class HiCacheController:
             producer_id=producer_id,
             generation=generation,
             session=session,
-            node_ids=list(node_ids),
-            num_tokens=len(device_indices),
+            node_ids=merged_node_ids,
+            num_tokens=merged_tokens,
         )
 
     def submit_streaming_load_range(

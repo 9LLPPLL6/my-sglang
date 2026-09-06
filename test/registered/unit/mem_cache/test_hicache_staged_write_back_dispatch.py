@@ -380,6 +380,92 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             counter.set_consumer(-1)
             counter.wait_until(1, timeout=0.001)
 
+    def test_layer_gate_pump_drives_the_submission_it_waits_for(self):
+        """The streaming layer gate must make progress on its own thread.
+
+        The model forward runs on the scheduler thread, and so does the storage
+        pipeline that submits each layer group. A gate that only slept on the
+        condition variable would wait for a submission nobody could produce, so
+        the wait drains the pipeline itself. Without the pump this case hangs
+        until its timeout instead of returning.
+        """
+        with mock.patch.object(
+            cache_controller_module, "device_module", _FakeDeviceModule
+        ):
+            counter = LayerDoneCounter(num_layers=4)
+            producer_index = counter.update_producer()
+            generation = counter.producer_generation
+            counter.set_consumer(producer_index, generation)
+
+            submitted = []
+
+            def pump():
+                # Stands in for "drain storage completions, submit the next
+                # layer range": one layer becomes available per call.
+                layer = len(submitted)
+                if layer < 4:
+                    counter.events[producer_index].complete(
+                        layer, generation=generation
+                    )
+                    submitted.append(layer)
+
+            with self.assertRaisesRegex(TimeoutError, "H2D submission"):
+                counter.wait_until(0, timeout=0.01)
+            self.assertEqual(submitted, [])
+
+            counter.stream_pump = pump
+            for layer in range(4):
+                counter.wait_until(layer, timeout=1.0)
+            self.assertEqual(submitted, [0, 1, 2, 3])
+
+            counter.reset()
+            self.assertIsNone(counter.stream_pump)
+
+    def test_streaming_load_absorbs_a_queued_ordinary_load_back(self):
+        """One batch has one consumer index, so one producer must carry both.
+
+        A request admitted alongside a storage-streamed one queues an ordinary
+        load-back through `cc.load`. If that stayed a separate producer, the
+        batch's single `hicache_consumer_index` would gate only one of them and
+        the other's layers would be read before their H2D was submitted.
+        """
+        with mock.patch.object(
+            cache_controller_module, "device_module", _FakeDeviceModule
+        ):
+            controller = HiCacheController.__new__(HiCacheController)
+            controller.layer_done_counter = LayerDoneCounter(num_layers=2)
+            controller.layer_num = 2
+            controller.io_backend = "direct"
+            controller.mem_pool_host = mock.Mock(layout="page_first_direct")
+            controller.mem_pool_device = mock.Mock()
+            controller.l2_transfer_engine = mock.Mock()
+            controller.l2_transfer_engine.begin_host_to_device_streaming.return_value = (
+                mock.Mock()
+            )
+            queued = CacheOperation(
+                torch.tensor([4, 5], dtype=torch.int64),
+                torch.tensor([6, 7], dtype=torch.int64),
+                node_id=77,
+            )
+            controller.load_queue = [queued]
+
+            handle = controller.start_streaming_load(
+                host_indices=torch.tensor([0, 1], dtype=torch.int64),
+                device_indices=torch.tensor([2, 3], dtype=torch.int64),
+                node_ids=[42],
+            )
+
+            self.assertEqual(controller.load_queue, [])
+            self.assertIn(42, handle.node_ids)
+            self.assertIn(77, handle.node_ids)
+            self.assertEqual(handle.num_tokens, 4)
+            transfers = (
+                controller.l2_transfer_engine.begin_host_to_device_streaming.call_args[
+                    0
+                ][0]
+            )
+            self.assertEqual(len(transfers), 2)
+
     def test_packed_draft_load_is_flattened_into_l2_transfers(self):
         host_pool = mock.Mock()
         controller = HybridCacheController.__new__(HybridCacheController)
