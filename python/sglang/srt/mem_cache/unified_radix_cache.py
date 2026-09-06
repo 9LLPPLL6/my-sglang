@@ -2662,18 +2662,27 @@ class UnifiedRadixCache(BasePrefixCache):
         from sglang.srt.mem_cache.layerwise_storage.radix_bridge import (
             LayerwiseRadixBridge,
         )
+        from sglang.srt.mem_cache.pool_host import HostPoolGroup
         from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
         from sglang.srt.mem_cache.storage.layerwise.hicache_layerwise_file import (
             HiCacheLayerwiseFile,
         )
 
         backend = self.cache_controller.storage_backend
-        host_pool = self.cache_controller.mem_pool_host
+        # storage_host_pool is the group's anchor: the KV pool the page files
+        # are addressed against, not the allocation facade around it.
+        host_pool = self.cache_controller.storage_host_pool
+        pool_group = self.cache_controller.mem_pool_host
         unsupported = None
         if not isinstance(backend, HiCacheLayerwiseFile):
             unsupported = f"storage backend {type(backend).__name__}"
         elif not isinstance(host_pool, MHATokenToKVPoolHost):
             unsupported = f"host pool {type(host_pool).__name__}"
+        elif isinstance(pool_group, HostPoolGroup) and len(pool_group.entries) > 1:
+            # Streaming moves KV only; a side pool would stay unloaded.
+            unsupported = f"{len(pool_group.entries)} host pools"
+        elif self.sidecar_pool_specs:
+            unsupported = "sidecar pools"
         elif len(self.tree_components) > 1:
             unsupported = f"cache components {sorted(self.tree_components)}"
         elif self.buffer_pipeline is not None:
@@ -2689,8 +2698,11 @@ class UnifiedRadixCache(BasePrefixCache):
             host_pool=host_pool,
             cache_controller=self.cache_controller,
             server_args=server_args,
-            tp_size=self.tp_size,
-            tp_group=None,
+            tp_size=self.tp_world_size,
+            # The cache's own gloo group, not the model's NCCL TP group: a
+            # collective issued between two layers of a forward must not share
+            # a communicator with the model's own collectives.
+            tp_group=self.tp_group,
         )
         self.layerwise_bridge = LayerwiseRadixBridge(cache=self, controller=controller)
         logger.info(
