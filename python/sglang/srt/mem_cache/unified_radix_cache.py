@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     IncLockRefResult,
     InitLoadBackParams,
+    InitLoadBackResult,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
@@ -243,6 +244,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # constructs the pipeline collaborator (None = cache mode).
         self.host_memory_mode = "cache"
         self.buffer_pipeline: Optional[BufferModePipeline] = None
+        # Layer-group storage streaming (--hicache-storage-load-mode=layerwise);
+        # None keeps the ordinary blocking L3 read.
+        self.layerwise_bridge = None
         # Write-side dedupe: beliefs about what storage already holds, so
         # re-inserts of hot prefixes skip the redundant backup.
         self.storage_existence_cache = StorageExistenceCache()
@@ -440,6 +444,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller.host_write_staged_tokens_fn = (
                 lambda: self.buffer_pipeline.write_staged_tokens_
             )
+
+        self._init_layerwise_streaming(server_args)
 
         # State initialization
         self.write_through_threshold = (
@@ -1758,6 +1764,8 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         )
+        if self.layerwise_bridge is not None:
+            self.layerwise_bridge.set_prefix_ctx(req_id, matched_prefix_tokens)
         if buffer_mode:
             self.buffer_pipeline.set_prefix_ctx(req_id, matched_prefix_tokens)
         else:
@@ -1784,6 +1792,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, req_id: str) -> bool:
+        if self.layerwise_bridge is not None and self.layerwise_bridge.has_staged(
+            req_id
+        ):
+            return self.layerwise_bridge.check_progress(req_id)
         if req_id not in self.ongoing_prefetch:
             return True
 
@@ -1987,9 +1999,16 @@ class UnifiedRadixCache(BasePrefixCache):
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    @property
+    def holds_staged_prefetch(self) -> bool:
+        return self.buffer_pipeline is not None or self.layerwise_bridge is not None
+
     def staged_prefetch_tokens(self, req_id: str) -> int:
-        """Tokens a staged buffer-mode prefetch would splice (0 = no hold);
-        surfaced by the scheduler as the request's host_hit_length."""
+        """Tokens a staged prefetch would splice (0 = no hold); surfaced by the
+        scheduler as the request's host_hit_length. Buffer mode and layerwise
+        streaming both hold their staging outside the tree until admission."""
+        if self.layerwise_bridge is not None:
+            return self.layerwise_bridge.staged_tokens(req_id)
         if self.buffer_pipeline is None:
             return 0
         return self.buffer_pipeline.staged_prefetch_tokens(req_id)
@@ -2209,6 +2228,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 # attributes off `operation` here — alternative cache
                 # controllers may expose a narrower surface.
                 self.buffer_pipeline.try_lock_anchor(req_id, info.anchor_node_id)
+            if self.layerwise_bridge is not None and self.layerwise_bridge.start(
+                operation
+            ):
+                # Streaming drives the read from the scheduler thread instead.
+                return True
             cc.prefetch_buffer.put(operation)
             return True
 
@@ -2584,6 +2608,11 @@ class UnifiedRadixCache(BasePrefixCache):
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
                 if (
+                    self.layerwise_bridge is not None
+                    and self.layerwise_bridge.try_finish_load_back(ack_id)
+                ):
+                    continue
+                if (
                     self.buffer_pipeline is not None
                     and self.buffer_pipeline.try_finish_load_back(ack_id)
                 ):
@@ -2610,6 +2639,78 @@ class UnifiedRadixCache(BasePrefixCache):
             finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----
+
+    def _init_layerwise_streaming(self, server_args) -> None:
+        """Attach the layer-group streaming bridge, or leave the default path.
+
+        Fails closed: anything the first implementation does not cover (a
+        non-MHA host pool, extra cache components, a backend that is not the
+        shared page store) keeps the ordinary blocking L3 read rather than
+        silently streaming something it cannot address.
+        """
+        if server_args.hicache_storage_load_mode != "layerwise":
+            return
+        if (
+            self.cache_controller is None
+            or self.cache_controller.storage_backend is None
+        ):
+            return
+
+        from sglang.srt.mem_cache.layerwise_storage.controller import (
+            LayerwiseStorageController,
+        )
+        from sglang.srt.mem_cache.layerwise_storage.radix_bridge import (
+            LayerwiseRadixBridge,
+        )
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+        from sglang.srt.mem_cache.storage.layerwise.hicache_layerwise_file import (
+            HiCacheLayerwiseFile,
+        )
+
+        backend = self.cache_controller.storage_backend
+        host_pool = self.cache_controller.mem_pool_host
+        unsupported = None
+        if not isinstance(backend, HiCacheLayerwiseFile):
+            unsupported = f"storage backend {type(backend).__name__}"
+        elif not isinstance(host_pool, MHATokenToKVPoolHost):
+            unsupported = f"host pool {type(host_pool).__name__}"
+        elif len(self.tree_components) > 1:
+            unsupported = f"cache components {sorted(self.tree_components)}"
+        elif self.buffer_pipeline is not None:
+            unsupported = "buffer_only host memory mode"
+        if unsupported is not None:
+            logger.warning(
+                "Layerwise storage streaming disabled: unsupported %s", unsupported
+            )
+            return
+
+        controller = LayerwiseStorageController.from_layerwise_backend(
+            backend=backend,
+            host_pool=host_pool,
+            cache_controller=self.cache_controller,
+            server_args=server_args,
+            tp_size=self.tp_size,
+            tp_group=None,
+        )
+        self.layerwise_bridge = LayerwiseRadixBridge(cache=self, controller=controller)
+        logger.info(
+            "Layerwise storage streaming enabled: first_group=%d layers, "
+            "group=%d layers, read_ahead=%d groups",
+            controller.config.first_group_layers,
+            controller.config.group_size,
+            controller.config.read_ahead_groups,
+        )
+
+    def init_load_back_with_ownership(
+        self,
+        params: InitLoadBackParams,
+    ) -> InitLoadBackResult:
+        """Admission-time consumption, dispatching to the streaming path."""
+        if self.layerwise_bridge is not None and self.layerwise_bridge.has_staged(
+            params.req.rid if params.req is not None else ""
+        ):
+            return self.layerwise_bridge.init_load_back(params)
+        return super().init_load_back_with_ownership(params)
 
     def init_load_back(
         self,
@@ -2717,7 +2818,16 @@ class UnifiedRadixCache(BasePrefixCache):
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
 
     def ready_to_load_host_cache(self) -> int:
-        """Notify the cache controller to start the KV cache loading."""
+        """Notify the cache controller to start the KV cache loading.
+
+        A streaming transaction already opened its own producer at admission
+        and absorbed anything else the batch queued, so the batch gates on that
+        slot instead of starting a second load.
+        """
+        if self.layerwise_bridge is not None:
+            streaming_index = self.layerwise_bridge.streaming_consumer_index()
+            if streaming_index >= 0:
+                return streaming_index
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0

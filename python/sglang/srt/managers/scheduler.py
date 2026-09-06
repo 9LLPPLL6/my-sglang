@@ -3449,11 +3449,9 @@ class Scheduler(
                     req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
-            if (
-                self.enable_hicache_storage
-                and self.server_args.hicache_host_memory_mode == "buffer_only"
-            ):
-                # Buffer mode: surface a staged prefetch as the request's host
+            if self.enable_hicache_storage and self.tree_cache.holds_staged_prefetch:
+                # Buffer mode and layerwise streaming: surface a staged
+                # prefetch as the request's host
                 # hit (consumed through init_load_back) plus its SWA window,
                 # which consumption allocates and the request lock pins —
                 # uncharged, the batch alloc can OOM. Set AFTER

@@ -27,7 +27,6 @@ from sglang.srt.mem_cache.layerwise_storage.consensus import (
 from sglang.srt.mem_cache.layerwise_storage.file_backend import LayerwiseFileBackend
 from sglang.srt.mem_cache.layerwise_storage.page_format import (
     PageIdentity,
-    model_fingerprint,
 )
 from sglang.srt.mem_cache.layerwise_storage.page_writer import PageFileWriter
 from sglang.srt.mem_cache.layerwise_storage.pipeline import (
@@ -47,6 +46,10 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+# Read queue depth for the streaming reader. Deep enough that one layer group of
+# a long prefix submits in a single batch on a page-file store.
+_READ_QUEUE_DEPTH = 512
 
 
 class LayerwiseControllerConfig(NamedTuple):
@@ -110,39 +113,25 @@ class LayerwiseStorageController:
         self._generation = 0
 
     @classmethod
-    def from_server_args(
+    def from_layerwise_backend(
         cls,
         *,
-        server_args: ServerArgs,
+        backend,
         host_pool: MHATokenToKVPoolHost,
         cache_controller: HiCacheController,
-        tp_rank: int,
+        server_args: ServerArgs,
         tp_size: int,
         tp_group=None,
-        model_name: str,
     ) -> LayerwiseStorageController:
-        dtype_name = str(host_pool.dtype).removeprefix("torch.")
-        identity = PageIdentity(
-            fingerprint=model_fingerprint(
-                model_name=model_name,
-                dtype_name=dtype_name,
-                layer_num=host_pool.layer_num,
-                page_size=host_pool.page_size,
-                local_kv_heads=host_pool.head_num,
-                head_dim=host_pool.head_dim,
-                tp_size=tp_size,
-            ),
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            dtype_name=dtype_name,
-            layer_num=host_pool.layer_num,
-            page_size=host_pool.page_size,
-            local_kv_heads=host_pool.head_num,
-            head_dim=host_pool.head_dim,
-            element_size=host_pool.dtype.itemsize,
-        )
+        """Build a controller that shares one page store with the write path.
+
+        The reader is constructed from the write-through backend's own writer,
+        root and alignment, so a page published by one is byte-addressable by
+        the other. Deriving them independently is how a silent key or geometry
+        mismatch would turn every hit into a miss.
+        """
         config = LayerwiseControllerConfig(
-            root=_storage_root(server_args),
+            root=backend.root,
             first_group_layers=server_args.hicache_storage_first_group_layers,
             group_size=server_args.hicache_storage_group_size,
             read_ahead_groups=server_args.hicache_storage_read_ahead_groups,
@@ -153,11 +142,18 @@ class LayerwiseStorageController:
             max_inflight_bytes=server_args.hicache_storage_max_inflight_bytes,
             slow_fallback=server_args.hicache_storage_slow_fallback,
         )
+        identity = backend.layout.identity
+        reader = LayerwiseFileBackend(
+            root=backend.root,
+            identity=identity,
+            queue_depth=_READ_QUEUE_DEPTH,
+            max_inflight_bytes=config.max_inflight_bytes,
+            alignment_profile=backend.alignment_profile,
+            require_direct_io=backend.require_direct_io,
+        )
         consensus: GroupConsensus
         if tp_size > 1 and tp_group is not None:
-            consensus = TorchDistGroupConsensus(
-                group=tp_group, device=server_args.device
-            )
+            consensus = TorchDistGroupConsensus(group=tp_group, device="cpu")
         else:
             consensus = SingleRankConsensus()
         return cls(
@@ -166,6 +162,8 @@ class LayerwiseStorageController:
             config=config,
             identity=identity,
             consensus=consensus,
+            backend=reader,
+            writer=backend.writer,
         )
 
     def query_hit_pages(self, page_keys: Sequence[str]) -> int:

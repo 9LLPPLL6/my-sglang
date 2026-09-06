@@ -409,6 +409,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             ownership=LoadBackOwnership.TREE,
         )
 
+    @property
+    def holds_staged_prefetch(self) -> bool:
+        """True when a completed fetch waits outside the tree until admission.
+
+        Buffer mode and layerwise streaming both park their staging privately,
+        so the scheduler has to surface it as the request's host_hit_length
+        instead of reading it back off a prefix match.
+        """
+        return False
+
     def ready_to_load_host_cache(self) -> Any:
         """
         Notify the cache controller to start the KV cache loading
