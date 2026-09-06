@@ -22,7 +22,6 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.layerwise_storage.consensus import (
     GroupConsensus,
     SingleRankConsensus,
-    TorchDistGroupConsensus,
 )
 from sglang.srt.mem_cache.layerwise_storage.file_backend import LayerwiseFileBackend
 from sglang.srt.mem_cache.layerwise_storage.page_format import (
@@ -151,11 +150,11 @@ class LayerwiseStorageController:
             alignment_profile=backend.alignment_profile,
             require_direct_io=backend.require_direct_io,
         )
-        consensus: GroupConsensus
-        if tp_size > 1 and tp_group is not None:
-            consensus = TorchDistGroupConsensus(group=tp_group, device="cpu")
-        else:
-            consensus = SingleRankConsensus()
+        # Cross-rank agreement happens once, at admission, in the radix bridge
+        # and off the forward path. Per-group collectives inside a forward would
+        # have to interleave with the model's own, and V1 already fails loudly
+        # on a post-admission read failure, so they would buy nothing.
+        consensus: GroupConsensus = SingleRankConsensus()
         return cls(
             host_pool=host_pool,
             cache_controller=cache_controller,

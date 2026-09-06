@@ -181,18 +181,50 @@ class LayerwiseRadixBridge:
         """Drive the pipeline; True once admission can be decided.
 
         Unlike the blocking path this returns as soon as the first layer group
-        is agreed across ranks — the rest of the prefix is still in flight and
-        will stream in behind the forward.
+        has landed — the rest of the prefix is still in flight and will stream
+        in behind the forward.
+
+        The decision is reduced across ranks before it is acted on. Ranks
+        observe their own storage at different times, so returning a local
+        verdict would let one rank admit a request the other did not, and the
+        two would then build different batches and deadlock on the model's own
+        collectives.
         """
         staged = self._staged.get(req_id)
         if staged is None:
             return True
         self.controller.poll()
         transaction = staged.transaction
-        if transaction.aborted:
-            self._discard(staged, reason=transaction.error or "storage read failed")
+
+        decided = transaction.aborted or transaction.admission_ready
+        usable = transaction.admission_ready and not transaction.aborted
+        decided, usable = self._agree(decided=decided, usable=usable)
+
+        if not decided:
+            return False
+        if not usable:
+            self._discard(
+                staged,
+                reason=transaction.error or "a rank could not read the first group",
+            )
             return True
-        return transaction.admission_ready
+        return True
+
+    def _agree(self, *, decided: bool, usable: bool) -> tuple[bool, bool]:
+        """MIN-reduce the admission decision so every rank acts on the same one.
+
+        A rank that gave up does not hold a collective open for its peers: it
+        reports "decided, unusable" and the peers converge on dropping the
+        transaction, bounded by their own group timeout.
+        """
+        cache = self._cache
+        if cache.tp_world_size <= 1:
+            return decided, usable
+        flags = torch.tensor(
+            [int(decided), int(usable)], dtype=torch.int32, device="cpu"
+        )
+        cache._all_reduce(flags, torch.distributed.ReduceOp.MIN)
+        return bool(flags[0].item()), bool(flags[1].item())
 
     def staged_tokens(self, req_id: str) -> int:
         """Tokens the admission step will splice in, surfaced as host_hit_length."""

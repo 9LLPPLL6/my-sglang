@@ -72,6 +72,7 @@ def _fake_cache():
     )
     return SimpleNamespace(
         page_size=_PAGE_SIZE,
+        tp_world_size=1,
         ongoing_prefetch={},
         cache_controller=cache_controller,
         prefetch_loaded_tokens_by_reqid={},
@@ -161,6 +162,38 @@ class TestLayerwiseRadixBridge(CustomTestCase):
 
         self.assertEqual(self.controller.quarantined, [req_id])
         self.cache.tree_core.insert_host.assert_not_called()
+
+    def test_admission_waits_for_every_rank_to_be_ready(self):
+        """A rank must not admit a transaction its peers cannot use.
+
+        Ranks see their own storage complete at different ticks. Acting on a
+        local verdict lets one rank admit a request the other skipped, and the
+        two then build different batches and deadlock on the model's own
+        collectives. The decision is MIN-reduced before it is acted on.
+        """
+        req_id, _ = _stage(self.bridge, self.cache, self.controller)
+        self.cache.tp_world_size = 2
+        self.cache._all_reduce = mock.Mock()
+        self.controller.transaction.admission_ready = True
+
+        def peer_not_ready(flags, op):
+            flags[0] = 0  # the peer has not decided yet
+            flags[1] = 0
+
+        self.cache._all_reduce.side_effect = peer_not_ready
+        self.assertFalse(self.bridge.check_progress(req_id))
+        self.assertTrue(self.bridge.has_staged(req_id))
+
+        def peer_failed(flags, op):
+            flags[0] = 1  # decided everywhere
+            flags[1] = 0  # but a peer could not read it
+
+        self.cache._all_reduce.side_effect = peer_failed
+        self.assertTrue(self.bridge.check_progress(req_id))
+        self.assertFalse(self.bridge.has_staged(req_id))
+        self.assertEqual(
+            self.cache.cache_controller.append_host_mem_release.call_count, 1
+        )
 
     def test_only_one_transaction_streams_at_a_time(self):
         _stage(self.bridge, self.cache, self.controller)
