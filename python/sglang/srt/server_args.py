@@ -8298,10 +8298,13 @@ class ServerArgs:
                 "--hicache-storage-load-mode=layerwise requires "
                 "--enable-hierarchical-cache."
             )
-        if cfg.hicache_storage_backend is None:
+        if cfg.hicache_storage_backend != "layerwise_file":
             raise ValueError(
                 "--hicache-storage-load-mode=layerwise requires "
-                "--hicache-storage-backend."
+                "--hicache-storage-backend=layerwise_file: the streaming reader "
+                "and the write-through writer must agree on page identity and "
+                "on-disk layout, and only that backend shares them. Got "
+                f"{cfg.hicache_storage_backend!r}."
             )
 
     def _validate_hicache_layerwise_compatibility(self):

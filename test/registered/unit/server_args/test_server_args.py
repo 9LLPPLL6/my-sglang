@@ -1522,7 +1522,7 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
     def _valid_layerwise_overrides(**overrides):
         values = {
             "enable_hierarchical_cache": True,
-            "hicache_storage_backend": "sim",
+            "hicache_storage_backend": "layerwise_file",
             "hicache_storage_load_mode": "layerwise",
             "hicache_host_memory_mode": "cache",
             "hicache_io_backend": "direct",
@@ -1680,11 +1680,13 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"):
             args._handle_hicache()
 
-        args = self._make_args(
-            **self._valid_layerwise_overrides(hicache_storage_backend=None)
-        )
-        with self.assertRaisesRegex(ValueError, "hicache-storage-backend"):
-            args._handle_hicache()
+        for backend in (None, "file", "nixl"):
+            with self.subTest(backend=backend):
+                args = self._make_args(
+                    **self._valid_layerwise_overrides(hicache_storage_backend=backend)
+                )
+                with self.assertRaisesRegex(ValueError, "layerwise_file"):
+                    args._handle_hicache()
 
     def test_kernel_io_backend_alias_is_normalized_before_validation(self):
         """``kernel`` + ``page_first_direct`` is rewritten to ``direct`` upstream.
