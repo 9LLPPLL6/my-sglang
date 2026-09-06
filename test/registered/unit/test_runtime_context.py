@@ -276,7 +276,7 @@ class TestLayerwiseHiCacheMemoryConfig(_IsolatedServerArgs):
         args = ServerArgs(
             model_path="dummy",
             enable_hierarchical_cache=True,
-            hicache_storage_backend="sim",
+            hicache_storage_backend="layerwise_file",
             hicache_storage_load_mode="layerwise",
             hicache_storage_first_group_layers=1,
             hicache_storage_group_size=4,
