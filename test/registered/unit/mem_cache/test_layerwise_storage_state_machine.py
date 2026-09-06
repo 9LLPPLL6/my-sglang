@@ -245,43 +245,45 @@ class TestLayerwiseStorageStateMachine(CustomTestCase):
         with self.assertRaises(InvalidStateTransition):
             transaction.advance(TransactionState.DONE)
 
-    def test_group_limits_apply_to_aligned_covering_io(self):
-        """Backend limits apply to submitted covering ranges, not payload bytes.
+    def test_a_group_larger_than_the_queue_is_still_accepted(self):
+        """Group size must not be validated against a submission window.
 
-        Direct I/O may transfer padding around compact payloads. Accounting the
-        smaller payload would silently exceed the queue byte budget.
+        A long prefix expands into far more extents than any sane queue depth,
+        and the I/O arbiter drains a group in waves. Rejecting such a group
+        would silently disable streaming exactly where it pays most, since the
+        caller falls back to the blocking read.
         """
+        group = _plan(group_count=1, extents_per_group=8).groups[0]
+        one_extent_window = LayerwiseBackendCapabilities(
+            required_alignment=4096,
+            supports_range_read=True,
+            supports_direct_to_host=True,
+            max_inflight_groups=1,
+            max_inflight_extents=1,
+            max_inflight_bytes=4096,
+            max_iov=1,
+            cancel_level=CancelLevel.BOUNDED_TERMINAL,
+        )
 
+        validate_group_against_capabilities(group=group, capabilities=one_extent_window)
+
+    def test_misaligned_extents_are_rejected(self):
+        """Alignment is the one thing the backend can never work around."""
         group = _plan(group_count=1, extents_per_group=2).groups[0]
-        capabilities = LayerwiseBackendCapabilities(
-            required_alignment=4096,
+        finer_alignment = LayerwiseBackendCapabilities(
+            required_alignment=8192,
             supports_range_read=True,
             supports_direct_to_host=True,
-            max_inflight_groups=2,
-            max_inflight_extents=2,
-            max_inflight_bytes=8192,
-            max_iov=2,
+            max_inflight_groups=8,
+            max_inflight_extents=64,
+            max_inflight_bytes=1 << 30,
+            max_iov=64,
             cancel_level=CancelLevel.BOUNDED_TERMINAL,
-        )
-        validate_group_against_capabilities(
-            group=group,
-            capabilities=capabilities,
         )
 
-        too_small = LayerwiseBackendCapabilities(
-            required_alignment=4096,
-            supports_range_read=True,
-            supports_direct_to_host=True,
-            max_inflight_groups=2,
-            max_inflight_extents=2,
-            max_inflight_bytes=8191,
-            max_iov=2,
-            cancel_level=CancelLevel.BOUNDED_TERMINAL,
-        )
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "not aligned"):
             validate_group_against_capabilities(
-                group=group,
-                capabilities=too_small,
+                group=group, capabilities=finer_alignment
             )
 
 

@@ -236,24 +236,17 @@ def validate_group_against_capabilities(
     group: LayerGroupPlan,
     capabilities: LayerwiseBackendCapabilities,
 ) -> None:
-    """Reject a group that cannot fit one backend submission window."""
+    """Reject a group the backend can never satisfy.
 
-    if len(group.extents) > capabilities.max_inflight_extents:
-        raise ValueError(
-            f"group {group.group_id} has {len(group.extents)} extents, exceeding "
-            f"the backend limit {capabilities.max_inflight_extents}"
-        )
-    if len(group.extents) > capabilities.max_iov:
-        raise ValueError(
-            f"group {group.group_id} has {len(group.extents)} extents, exceeding "
-            f"the backend iov limit {capabilities.max_iov}"
-        )
-    if group.total_io_nbytes > capabilities.max_inflight_bytes:
-        raise ValueError(
-            f"group {group.group_id} has {group.total_io_nbytes} I/O bytes, "
-            f"exceeding the backend limit {capabilities.max_inflight_bytes}"
-        )
+    Group size is deliberately not checked against the queue depth or the
+    in-flight byte budget: those are per-submission windows that the I/O
+    arbiter drains in waves. Rejecting a group larger than one window would
+    disable streaming exactly where it pays most, since a long prefix expands
+    into more extents than any sane queue depth.
 
+    A single extent that cannot fit the whole byte budget is different -- it
+    could never be submitted at all -- and the arbiter rejects that on enqueue.
+    """
     alignment = capabilities.required_alignment
     for extent in group.extents:
         if extent.io_offset % alignment or extent.io_nbytes % alignment:
