@@ -9,28 +9,85 @@ Two paths live here, sharing one on-disk format:
 | path | status | what it does |
 |---|---|---|
 | `--hicache-storage-backend layerwise_file` | working, measured | whole-prefix L3 reads with `O_DIRECT` + Linux AIO, landing straight in the host KV pool |
-| `--hicache-storage-load-mode layerwise` | components built and unit-tested; not yet wired into `UnifiedRadixCache` | per-layer-group streaming so storage read, H2D and forward overlap |
+| `--hicache-storage-load-mode layerwise` | working for one streaming request at a time; validated on TP=1 and TP=2 | per-layer-group streaming so the storage read, H2D and forward overlap |
 
-## Measured, Qwen3-8B TP=1, page 64, 8.8k-token cached prefix
+Stage write-ups with the full methodology live in `L2L3fusion-docs/`.
+
+## Measured, Qwen3-8B, page 64, 8.8k-token cached prefix
 
 Page cache dropped before every L3 read (`posix_fadvise(DONTNEED)`), otherwise a
-buffered backend is measuring RAM, not storage.
+buffered backend measures RAM, not storage.
+
+Backend comparison, TP=1, short suffix:
 
 | | TTFT |
 |---|---|
 | recompute the prefix | 931 ms |
 | L3 hit, `file` backend | 924 ms |
 | L3 hit, `layerwise_file` backend | 444 ms |
-| L1/L2 hit | 51 ms |
+| L1 / L2 hit (indistinguishable) | 51 ms |
 
 The stock file backend saved nothing over recomputing. `layerwise_file` is 2.1x
-faster than it and 2.1x faster than recompute. The remaining 444 -> 51 ms is
-what the streaming path targets.
+faster than it and 2.1x faster than recompute.
 
-Storage microbenchmark: `benchmark/hicache/bench_layerwise_storage.py`. On one
-NVMe the layer-range read reaches 94% of the raw whole-page Direct AIO ceiling
-at `--group-size 8`, and collapses to 53% at `--group-size 2` — group size is
-the knob that decides whether range reads cost anything.
+Pipeline A/B with the same backend on both sides, so the difference is the
+pipeline alone:
+
+| suffix | TP=1 full_wait | TP=1 layerwise | TP=2 full_wait | TP=2 layerwise |
+|---|---|---|---|---|
+| ~6 tok | 462 ms | 390 ms | 416 ms | 384 ms |
+| ~2100 tok | 731 ms | 460 ms | 598 ms | 438 ms |
+| ~4200 tok | 1058 ms | 751 ms | | |
+
+Correctness is checked as L1-hit vs L3-streamed, not recompute vs L3: recompute
+and a cached-prefix run are not bit-identical (different kernel paths), so
+comparing against recompute reports false failures. L1 vs L3 was identical 3/3
+on both TP=1 and TP=2.
+
+## When the read is hidden
+
+Per layer the pipeline needs read <= compute; multiplied by the layer count that
+collapses to "total read time <= suffix compute time":
+
+```
+ S       b * R
+--- >=  -------
+ H        BW
+```
+
+`H` = hit tokens, `S` = newly computed tokens, `b` = KV bytes per token per rank
+(`2 * layers * local_kv_heads * head_dim * dtype_bytes`), `R` = suffix prefill
+rate, `BW` = per-rank read bandwidth. The right side does not involve the prefix
+length, so the condition is a fixed ratio.
+
+Measured with `H` pinned at 8832: the cost of going through L3 over pure compute
+falls from 346 ms to a floor of ~90 ms, knee at `S/H ~ 0.3`, which is what the
+formula predicts for this box (0.24-0.29). The ~90 ms floor is group 0 plus
+admission plus the last group's tail -- about 27% of the full read, so the
+pipeline hides at best 73% of it.
+
+TP barely moves the ratio: `b` shrinks and `R` grows together. Only real
+per-rank storage bandwidth lowers it.
+
+## Picking `--hicache-storage-group-size`
+
+This box's root NVMe tops out at 3.45 GiB/s and ~28.2k IOPS (fio, read-only,
+flat across 128k/512k/2m at QD>=16). It is PCIe-limited, not flash-limited: the
+Samsung 990 PRO negotiated Gen3 x4 against its Gen4 capability.
+
+| group_size | extent size | achieved | of ceiling |
+|---|---|---|---|
+| 1 | 64 KiB | 1.72 GiB/s | 50% |
+| 2 | 128 KiB | 1.91 GiB/s | 55% |
+| 4 | 256 KiB | 2.76 GiB/s | 80% |
+| 8+ | 512 KiB+ | 3.26 GiB/s | 94% |
+| whole page | 2.36 MiB | 3.44 GiB/s | 99.7% |
+
+`group_size=1` lands exactly on the IOPS ceiling (28.2k x 64 KiB = 1.72 GiB/s):
+small extents hit the IOPS wall instead of the bandwidth wall. The knob's job is
+to grow the extent past that. Beyond 8 layers there is nothing left to gain
+here. Re-run `benchmark/hicache/bench_layerwise_storage.py` on the target
+storage; the best point differs per device.
 
 ## On-disk format
 
@@ -44,6 +101,12 @@ K[layer 0 .. N-1]     each layer: page_size x local_kv_heads x head_dim
 V[layer 0 .. N-1]
 [padding to alignment]
 ```
+
+Splitting a page into a K extent and a V extent is what makes the read
+zero-copy: a page's K and V are half a buffer apart in the host pool, so one
+read can never fill both, but each side alone is contiguous in memory and on
+disk. Verified aligned for TP=1/2/4/8 at every layer-group boundary, so the
+Direct I/O target is the KV pool address itself and no bounce buffer is used.
 
 Padding exists only on disk and is never treated as host capacity. Identity
 (model fingerprint, TP size/rank, dtype, geometry, offsets, checksum) lives in
@@ -75,9 +138,10 @@ Path layout — the directory tree partitions only on what it must:
 | `plan_builder.py` | host geometry + file geometry -> ordered layer-group read plan |
 | `types.py` / `backend.py` | value types and the async backend interface |
 | `state_machine.py` | transaction and group lifecycles, private-buffer ownership |
-| `consensus.py` | non-blocking per-group cross-rank agreement |
 | `pipeline.py` | the streaming driver: drain, agree, hand off, read ahead |
-| `controller.py` | scheduler-facing entry point tying it all together |
+| `controller.py` | ties the pipeline to one page store and one H2D session |
+| `radix_bridge.py` | the `UnifiedRadixCache` glue: take over a hit, gate admission, consume at load-back, release |
+| `consensus.py` | the per-group agreement interface. Only `SingleRankConsensus` is used: cross-rank agreement happens once at admission, in `radix_bridge`, off the forward path. `TorchDistGroupConsensus` has no callers |
 
 ## Configuration
 
@@ -88,6 +152,14 @@ Path layout — the directory tree partitions only on what it must:
 --hicache-write-policy write_through
 --hicache-host-memory-mode cache
 
+# add these for layer-group streaming
+--hicache-storage-load-mode layerwise
+--hicache-storage-first-group-layers 1          # the one group nothing can hide
+--hicache-storage-group-size 8
+--hicache-storage-read-ahead-groups 2           # in-flight groups = this + 1
+--disable-overlap-schedule
+--chunked-prefill-size -1
+
 SGLANG_HICACHE_LAYERWISE_ROOT=/mnt/parallel-fs/sglang-hicache
 SGLANG_HICACHE_LAYERWISE_MAX_SIZE=2Ti          # empty or 0 = unlimited
 SGLANG_HICACHE_LAYERWISE_MIN_FREE_SPACE=8Gi    # 0 disables the watermark
@@ -96,24 +168,28 @@ SGLANG_HICACHE_LAYERWISE_MIN_FREE_SPACE=8Gi    # 0 disables the watermark
 The free-space watermark defaults to non-zero on purpose: losing a cached page
 costs a recompute, filling the device kills the scheduler process.
 
-Streaming knobs (`--hicache-storage-load-mode layerwise`) are validated but
-inert until the pipeline is wired into the radix cache:
-`--hicache-storage-first-group-layers`, `--hicache-storage-group-size`,
-`--hicache-storage-read-ahead-groups`, `--hicache-storage-group-timeout-ms`,
-`--hicache-storage-admission-budget-ms`, `--hicache-storage-max-inflight-bytes`,
-`--hicache-storage-slow-fallback`.
+Streaming requires the `layerwise_file` backend, since the reader and the
+write-through writer have to agree on page identity and on-disk layout. Startup
+logs `Layerwise storage streaming enabled: ...`; a
+`Layerwise storage streaming disabled: unsupported ...` line means it fell
+closed to the ordinary blocking read, and says why.
 
-## What the streaming path still needs
+Streaming falls closed for a non-MHA host pool, side or sidecar pools, more than
+one cache component, buffer-only host memory, or any other backend.
 
-The pipeline, its backend, the H2D session (`L2TransferEngine`
-`begin/submit_range/finish`) and the generation-aware layer gate all exist and
-are tested. What is missing is the wiring in `UnifiedRadixCache`:
+## What streaming still needs
 
-1. Route a storage hit to `LayerwiseStorageController.begin` instead of the
-   blocking prefetch thread, and gate admission on group 0 only.
-2. Keep the host staging out of the radix tree until every group is agreed and
-   the forward pass consumed it, then publish it as an ordinary L2 node.
-3. Release device slots through `LoadBackOwnership.REQUEST` on abort, and host
-   staging only once the backend reports the read terminal.
-4. Multi-request streaming, mixing with running decode, and the poison/replay
-   path for a failure after admission.
+1. **More than one streaming transaction at a time.** A second concurrent
+   storage hit silently uses the blocking path. Verified not to hang or diverge
+   ranks under three concurrent hits on TP=2, but it does not accelerate.
+2. **A storage failure after admission.** The device slots are already
+   published and partly filled, so the pump raises rather than serving KV it
+   never read. The plan's poison/replay is not implemented.
+3. **Fault injection on real ranks.** The admission decision is MIN-reduced
+   across ranks and unit-tested against a simulated peer, but a mid-transaction
+   read failure has not been injected on two live ranks.
+4. **Mixing with running decode**, and a real mixed read/write load through the
+   arbiter. Both are untested.
+5. **MLA / SWA / Mamba**, held out by the fail-closed guard.
+
+Items 1 and 2 are the hard gates before this is serving-ready.
