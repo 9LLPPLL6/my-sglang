@@ -112,7 +112,11 @@ class PageFileWriter:
         )
 
     def read_layout(self, page_key: str) -> PageLayout:
-        """Parse a published page's header, failing closed on any mismatch."""
+        """Parse a published page's header, raising on any identity mismatch.
+
+        Provided for a reader that wants to verify a page before loading it.
+        The streaming and whole-prefix read paths do not call this today.
+        """
         path = self.page_path(page_key)
         with open(path, "rb", buffering=0) as handle:
             raw = handle.read(self.layout.header_nbytes)

@@ -14,8 +14,15 @@ V[layer 0 .. layer N-1]
 Keeping the payload identical to ``get_data_page(..., flat=True)`` means the
 existing write-through path and the layerwise range-read path agree without a
 second copy of the KV layout.  The header is a fixed-size aligned prefix so the
-first K layer starts on a Direct I/O boundary; identity fields in the header let
-a reader fail closed on a stale or foreign file instead of loading wrong KV.
+first K layer starts on a Direct I/O boundary.
+
+The header also records the page's full identity so a reader *can* verify what
+it is about to load.  Nothing on the read path does so today: it addresses pages
+through the directory tree, which carries the format version, a truncated
+fingerprint and the TP shard, and computes offsets from the running process's
+own layout.  ``decode_header`` and ``PageFileWriter.read_layout`` exist for that
+check and currently have no callers, so a page moved between trees, or made
+visible by a rename whose payload never reached the device, is not detected.
 """
 
 from __future__ import annotations
@@ -48,7 +55,7 @@ class InvalidPageHeader(ValueError):
 
 
 class PageIdentity(NamedTuple):
-    """Everything a reader must agree on before trusting a page payload."""
+    """The page identity a reader would have to match to trust the payload."""
 
     fingerprint: bytes
     tp_size: int
@@ -183,9 +190,9 @@ def encode_header(
 def decode_header(raw: bytes) -> PageLayout:
     """Parse and validate a page header prefix.
 
-    Raises :class:`InvalidPageHeader` rather than returning a partially trusted
-    layout: a caller that cannot fully identify a page must fall back to
-    recompute instead of loading unknown bytes into the KV cache.
+    Raises :class:`InvalidPageHeader` rather than returning a partially
+    trusted layout, so a caller that cannot fully identify a page can fall back
+    to recompute. No caller does this yet; see the module docstring.
     """
     if len(raw) < _HEADER_STRUCT.size:
         raise InvalidPageHeader(

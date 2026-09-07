@@ -47,8 +47,14 @@ V[layer 0 .. N-1]
 
 Padding exists only on disk and is never treated as host capacity. Identity
 (model fingerprint, TP size/rank, dtype, geometry, offsets, checksum) lives in
-the header, never in the filename, so a format change never renames files. A
-reader that cannot fully identify a page fails closed and recomputes.
+the header, never in the filename, so a format change never renames files.
+
+The read path does not verify that header yet. It relies on the directory tree
+for identity and computes offsets from the running process's layout, so a page
+moved between trees -- or one whose rename became visible before its payload
+reached the device, since the writer does not fsync -- would be loaded as valid
+KV. `decode_header` and `PageFileWriter.read_layout` implement the check and
+have no callers.
 
 Path layout — the directory tree partitions only on what it must:
 
