@@ -147,6 +147,7 @@ Path layout — the directory tree partitions only on what it must:
 
 ```
 --hicache-storage-backend layerwise_file        # the fast whole-prefix path
+--hicache-storage-io-threads 1                 # >1 shards a batch across submitters
 --hicache-io-backend direct
 --hicache-mem-layout page_first_direct
 --hicache-write-policy write_through
@@ -167,6 +168,16 @@ SGLANG_HICACHE_LAYERWISE_MIN_FREE_SPACE=8Gi    # 0 disables the watermark
 
 The free-space watermark defaults to non-zero on purpose: losing a cached page
 costs a recompute, filling the device kills the scheduler process.
+
+`--hicache-storage-io-threads` picks how many threads submit the whole-prefix
+read. The default of 1 is enough for a single local NVMe, which one thread
+saturates. A parallel filesystem is different: its per-request cost is paid by
+the submitting thread, so one thread plateaus far below the aggregate bandwidth
+no matter how deep its queue. Above 1 each worker owns an AIO context and a
+contiguous slice of the batch's pages, so no page file is touched by two
+threads. It is refused rather than ignored with any other backend or with
+`--hicache-storage-load-mode layerwise`, whose controller has its own
+single-context submitter.
 
 Streaming requires the `layerwise_file` backend, since the reader and the
 write-through writer have to agree on page identity and on-disk layout. Startup

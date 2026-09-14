@@ -2928,6 +2928,17 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = "full_wait"
+    hicache_storage_io_threads: A[
+        int,
+        "Number of worker threads the layerwise_file backend uses to submit "
+        "whole-prefix storage reads. 1 keeps the single-context submission "
+        "every other backend uses; a higher value gives each worker its own "
+        "Linux AIO context and shards pages across them, so no page file is "
+        "touched by two threads. A parallel filesystem needs this to reach its "
+        "aggregate read bandwidth -- one submitting thread saturates well below "
+        "it. Applies to --hicache-storage-load-mode=full_wait only.",
+        NS("memory"),
+    ] = 1
     hicache_storage_backend_extra_config: A[
         Optional[str],
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
@@ -8252,6 +8263,7 @@ class ServerArgs:
         boundary so malformed opt-in configurations fail before model loading.
         """
         cfg = resolving_view(self)
+        self._validate_hicache_storage_io_threads()
         if cfg.hicache_storage_load_mode == "full_wait":
             return
         if cfg.hicache_storage_load_mode != "layerwise":
@@ -8305,6 +8317,36 @@ class ServerArgs:
                 "and the write-through writer must agree on page identity and "
                 "on-disk layout, and only that backend shares them. Got "
                 f"{cfg.hicache_storage_backend!r}."
+            )
+
+    def _validate_hicache_storage_io_threads(self):
+        """Validate the parallel-submission knob for the whole-prefix read path.
+
+        It is refused rather than ignored wherever it would do nothing: a
+        thread count that silently has no effect is indistinguishable from one
+        that does, and the whole point of the knob is measuring the difference.
+        """
+        cfg = resolving_view(self)
+        threads = cfg.hicache_storage_io_threads
+        if threads < 1:
+            raise ValueError(
+                f"--hicache-storage-io-threads must be >= 1, got {threads}."
+            )
+        if threads == 1:
+            return
+        if cfg.hicache_storage_backend != "layerwise_file":
+            raise ValueError(
+                "--hicache-storage-io-threads > 1 requires "
+                "--hicache-storage-backend=layerwise_file: it is that backend's "
+                "own Direct I/O submission path. Got "
+                f"{cfg.hicache_storage_backend!r}."
+            )
+        if cfg.hicache_storage_load_mode != "full_wait":
+            raise ValueError(
+                "--hicache-storage-io-threads > 1 requires "
+                "--hicache-storage-load-mode=full_wait: the layerwise streaming "
+                "pipeline submits through its own single-context controller and "
+                "would ignore the thread count."
             )
 
     def _validate_hicache_layerwise_compatibility(self):

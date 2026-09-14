@@ -1660,6 +1660,57 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     args._handle_hicache()
 
+    def test_io_threads_defaults_to_one_and_needs_the_right_backend(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(["--model-path", "dummy"])
+        self.assertEqual(parsed.hicache_storage_io_threads, 1)
+
+        # One thread is the pre-existing path, so it stays legal everywhere --
+        # including with no storage backend at all.
+        self._make_args(
+            enable_hierarchical_cache=True, hicache_storage_io_threads=1
+        )._handle_hicache()
+
+    def test_io_threads_is_refused_where_it_would_do_nothing(self):
+        cases = (
+            (
+                {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "file",
+                    "hicache_storage_io_threads": 4,
+                },
+                "layerwise_file",
+            ),
+            (
+                self._valid_layerwise_overrides(hicache_storage_io_threads=4),
+                "full_wait",
+            ),
+            (
+                {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "layerwise_file",
+                    "hicache_storage_io_threads": 0,
+                },
+                ">= 1",
+            ),
+        )
+        for overrides, message in cases:
+            with self.subTest(message=message):
+                args = self._make_args(**overrides)
+                with self.assertRaisesRegex(ValueError, message):
+                    args._handle_hicache()
+
+    def test_io_threads_is_accepted_on_the_whole_prefix_read_path(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="layerwise_file",
+            hicache_storage_load_mode="full_wait",
+            hicache_storage_io_threads=8,
+        )
+        args._handle_hicache()
+        self.assertEqual(args.hicache_storage_io_threads, 8)
+
     def test_layerwise_direct_constructor_rejects_unknown_enums(self):
         args = self._make_args(hicache_storage_load_mode="stream-everything")
         with self.assertRaisesRegex(ValueError, "full_wait.*layerwise"):
