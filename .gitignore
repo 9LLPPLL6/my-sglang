@@ -281,3 +281,6 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# hicache
+benchmark/hicache/results/
