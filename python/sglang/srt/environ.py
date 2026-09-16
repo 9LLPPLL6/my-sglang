@@ -686,6 +686,11 @@ class Envs:
     # ===================================================================
     # HiCache storage backends and mmap allocation
     # ===================================================================
+    # Max pages one batched storage read/write call may carry. The controller
+    # walks a prefix in batches of this size and waits for each before starting
+    # the next, so it also caps how much a parallel backend can have in flight:
+    # a 2048-page prefix at the default is 16 serialized round trips.
+    SGLANG_HICACHE_STORAGE_BATCH_SIZE = EnvInt(128)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)

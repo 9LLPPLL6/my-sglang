@@ -19,8 +19,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Max pages per batched storage IO call.
-STORAGE_BATCH_SIZE = 128
+# Max pages per batched storage IO call. Read once at import: it sizes the
+# controller's batching loop, which is a deployment property rather than a
+# per-request decision.
+STORAGE_BATCH_SIZE = envs.SGLANG_HICACHE_STORAGE_BATCH_SIZE.get()
 
 
 @dataclass
