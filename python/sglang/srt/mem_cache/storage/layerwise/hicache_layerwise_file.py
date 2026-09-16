@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List, Optional
 
@@ -144,11 +145,13 @@ class HiCacheLayerwiseFile(HiCacheStorage):
             return []
         results = [True] * len(keys)
         shards = _split_positions(len(keys), self.io_threads)
+        started = time.perf_counter()
+        splits: List[tuple[float, float]] = []
         with self._batch_lock:
             if len(shards) == 1:
-                self._read_shard(
+                splits.append(self._read_shard(
                     self._contexts[0], keys, host_indices, shards[0], results
-                )
+                ))
             else:
                 futures = [
                     self._pool.submit(
@@ -167,12 +170,51 @@ class HiCacheLayerwiseFile(HiCacheStorage):
                 error = None
                 for future in futures:
                     try:
-                        future.result()
+                        splits.append(future.result())
                     except Exception as exception:  # noqa: BLE001 - re-raised below
                         error = error or exception
                 if error is not None:
                     raise error
-        return _truncate_at_first_failure(results)
+        truncated = _truncate_at_first_failure(results)
+        self._log_read(truncated, time.perf_counter() - started, splits)
+        return truncated
+
+    def _log_read(
+        self,
+        results: List[bool],
+        elapsed_s: float,
+        splits: List[tuple[float, float]],
+    ) -> None:
+        """Report what this batch actually moved from L3 into the host pool.
+
+        One line per batch, with the bytes that landed rather than the bytes
+        requested, so a truncated prefix is not reported as full bandwidth.
+        This is the only place that sees both the byte count and the wall time
+        of the storage read; everything upstream can only difference two TTFTs.
+
+        ``ms`` is what the request waits for. ``open_ms`` and ``io_ms`` are the
+        slowest shard's halves -- shards run concurrently, so their critical
+        path, not their sum, is what ``ms`` is made of. ``GiB/s`` divides by the
+        transfer alone, which is the figure that describes the storage; the
+        request's effective rate is bytes over ``ms``.
+        """
+        pages = sum(1 for ok in results if ok)
+        if not pages:
+            return
+        nbytes = pages * 2 * self._region_nbytes
+        open_s = max((s[0] for s in splits), default=0.0)
+        io_s = max((s[1] for s in splits), default=0.0)
+        logger.info(
+            "layerwise_file read: pages=%d bytes=%d ms=%.2f open_ms=%.2f io_ms=%.2f "
+            "GiB/s=%.2f threads=%d",
+            pages,
+            nbytes,
+            elapsed_s * 1e3,
+            open_s * 1e3,
+            io_s * 1e3,
+            nbytes / (1 << 30) / io_s if io_s > 0 else 0.0,
+            self.io_threads,
+        )
 
     def batch_set_v1(
         self,
@@ -239,21 +281,30 @@ class HiCacheLayerwiseFile(HiCacheStorage):
         host_indices: torch.Tensor,
         positions: range,
         results: List[bool],
-    ) -> None:
+    ) -> tuple[float, float]:
         """Read one worker's slice of the batch on its own context.
 
         ``results`` is shared with the other workers, but the slices are
         disjoint and each worker writes only its own positions, so no entry is
         ever written twice.
+
+        Returns ``(open_s, io_s)``. The split matters on a parallel filesystem:
+        one ``open()`` per page is a metadata round trip there, and a batch of
+        them can cost as much as the transfer. Folding the two together would
+        report a metadata rate as a bandwidth.
         """
+        opened = time.perf_counter()
         requests, records, failures = self._plan_batch(keys, host_indices, positions)
+        open_s = time.perf_counter() - opened
         for position in failures:
             results[position] = False
+        started = time.perf_counter()
         try:
             if requests:
                 self._run_batch(context, requests, records, results)
         finally:
             self._release(records)
+        return open_s, time.perf_counter() - started
 
     def _plan_batch(
         self, keys: List[str], host_indices: torch.Tensor, positions: range

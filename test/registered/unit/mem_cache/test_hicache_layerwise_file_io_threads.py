@@ -8,6 +8,7 @@ own position rather than a shard boundary, and a batch smaller than the thread
 count is still served.
 """
 
+import os
 import shutil
 import tempfile
 
@@ -145,8 +146,6 @@ class TestLayerwiseFileIoThreads(CustomTestCase):
         keys, indices, _ = self._write_pages(backend, host, pages)
         # Page 5 sits in the last shard; the prefix must end there, not at the
         # boundary of whichever shard happened to notice.
-        import os
-
         os.unlink(backend.writer.page_path(keys[5]))
         results = backend.batch_get_v1(keys, indices)
         self.assertEqual(results, [True] * 5 + [False] * 3)
