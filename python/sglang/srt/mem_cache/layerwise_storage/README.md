@@ -179,6 +179,31 @@ threads. It is refused rather than ignored with any other backend or with
 `--hicache-storage-load-mode layerwise`, whose controller has its own
 single-context submitter.
 
+`SGLANG_HICACHE_STORAGE_BATCH_SIZE` (default 128) caps the pages the controller
+hands the backend per call, and it waits for each batch before starting the
+next. That also caps how much a parallel backend can have in flight: a
+2048-page prefix at the default is 16 serialized round trips, which no amount
+of `--hicache-storage-io-threads` can overlap.
+
+On GPFS, measured at TP=2 with `--page-size 64` (medians of 3-4 runs): 16
+threads read a 20 GiB prefix 2.1x faster than 1 (50.5 vs 23.4 GiB/s per rank)
+and took 284 ms off TTFT. The next cost is one `open()` per page, a quarter to
+a third of the read. That is a scheduling round trip rather than a storage one
+-- it roughly doubles whenever the machine's cores are busy, and the read
+itself is what makes them busy -- but it does not grow with the thread count.
+Interleaving the opens with submission does not help either: it moves them
+under the in-flight I/O, where they cost ~30% more.
+
+**`--page-size` is the bigger lever, and it changes the answer above.** At 512
+a page file is 40 MiB instead of 5, so the same prefix is 8x fewer files: the
+open cost falls 6-9x (73 ms to 12 ms for a 20 GiB prefix) and the best time for
+that prefix drops from 269 ms to 141 ms (76.9 GiB/s per rank). It also moves
+the thread count's sweet spot down -- bigger extents put more bytes in flight
+per context, so 16 threads still win but by 1.3-1.9x instead of 2.1-2.5x, and a
+single-process sweep puts the knee at 4-8. Tune the two together; neither one's
+optimum survives changing the other. See
+`L2L3fusion-docs/04-parallel-submission-and-the-open-cost.md`.
+
 Streaming requires the `layerwise_file` backend, since the reader and the
 write-through writer have to agree on page identity and on-disk layout. Startup
 logs `Layerwise storage streaming enabled: ...`; a
