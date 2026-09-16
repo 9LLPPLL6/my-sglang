@@ -57,7 +57,6 @@ class LayerwiseControllerConfig(NamedTuple):
     group_size: int
     group_timeout_s: float
     admission_budget_s: float
-    max_inflight_bytes: int
     slow_fallback: str
     queue_depth: int = 128
 
@@ -94,7 +93,6 @@ class LayerwiseStorageController:
             root=config.root,
             identity=identity,
             queue_depth=config.queue_depth,
-            max_inflight_bytes=config.max_inflight_bytes,
             alignment_profile=self.writer.alignment_profile,
         )
         self.pipeline = LayerwiseStoragePipeline(
@@ -135,7 +133,6 @@ class LayerwiseStorageController:
             admission_budget_s=(
                 server_args.hicache_storage_admission_budget_ms / 1000.0
             ),
-            max_inflight_bytes=server_args.hicache_storage_max_inflight_bytes,
             slow_fallback=server_args.hicache_storage_slow_fallback,
         )
         identity = backend.layout.identity
@@ -143,7 +140,6 @@ class LayerwiseStorageController:
             root=backend.root,
             identity=identity,
             queue_depth=_READ_QUEUE_DEPTH,
-            max_inflight_bytes=config.max_inflight_bytes,
             alignment_profile=backend.alignment_profile,
             require_direct_io=backend.require_direct_io,
         )

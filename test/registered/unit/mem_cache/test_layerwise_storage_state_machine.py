@@ -260,7 +260,6 @@ class TestLayerwiseStorageStateMachine(CustomTestCase):
             supports_direct_to_host=True,
             max_inflight_groups=1,
             max_inflight_extents=1,
-            max_inflight_bytes=4096,
             max_iov=1,
             cancel_level=CancelLevel.BOUNDED_TERMINAL,
         )
@@ -276,7 +275,6 @@ class TestLayerwiseStorageStateMachine(CustomTestCase):
             supports_direct_to_host=True,
             max_inflight_groups=8,
             max_inflight_extents=64,
-            max_inflight_bytes=1 << 30,
             max_iov=64,
             cancel_level=CancelLevel.BOUNDED_TERMINAL,
         )

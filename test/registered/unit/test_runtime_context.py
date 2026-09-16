@@ -268,7 +268,6 @@ class TestLayerwiseHiCacheMemoryConfig(_IsolatedServerArgs):
         self.assertEqual(memory.hicache_storage_group_size, 1)
         self.assertEqual(memory.hicache_storage_group_timeout_ms, 1000)
         self.assertEqual(memory.hicache_storage_admission_budget_ms, 0)
-        self.assertEqual(memory.hicache_storage_max_inflight_bytes, 1 << 30)
         self.assertEqual(memory.hicache_storage_slow_fallback, "full_wait")
 
     def test_layerwise_values_are_projected_into_memory_namespace(self):
@@ -281,7 +280,6 @@ class TestLayerwiseHiCacheMemoryConfig(_IsolatedServerArgs):
             hicache_storage_group_size=4,
             hicache_storage_group_timeout_ms=2500,
             hicache_storage_admission_budget_ms=0,
-            hicache_storage_max_inflight_bytes=512 << 20,
             hicache_storage_slow_fallback="recompute",
         )
         args.resolve_once()
@@ -293,7 +291,6 @@ class TestLayerwiseHiCacheMemoryConfig(_IsolatedServerArgs):
         self.assertEqual(memory.hicache_storage_group_size, 4)
         self.assertEqual(memory.hicache_storage_group_timeout_ms, 2500)
         self.assertEqual(memory.hicache_storage_admission_budget_ms, 0)
-        self.assertEqual(memory.hicache_storage_max_inflight_bytes, 512 << 20)
         self.assertEqual(memory.hicache_storage_slow_fallback, "recompute")
 
 

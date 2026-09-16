@@ -125,7 +125,6 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
         root: str,
         identity: PageIdentity,
         queue_depth: int = 128,
-        max_inflight_bytes: int = 1 << 30,
         fd_cache_capacity: int = 1024,
         alignment_profile: Optional[AlignmentProfile] = None,
         require_direct_io: bool = True,
@@ -142,9 +141,7 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
             )
 
         self._context = LinuxAioContext(queue_depth=queue_depth)
-        self._arbiter = IoArbiter(
-            context=self._context, max_inflight_bytes=max_inflight_bytes
-        )
+        self._arbiter = IoArbiter(context=self._context)
         self._files = DirectIOFileCache(capacity=fd_cache_capacity)
         self._bounce = BouncePool(alignment=self.alignment_profile.memory_alignment)
         self._capabilities = LayerwiseBackendCapabilities(
@@ -153,7 +150,6 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
             supports_direct_to_host=True,
             max_inflight_groups=max(1, queue_depth // 2),
             max_inflight_extents=queue_depth,
-            max_inflight_bytes=max_inflight_bytes,
             max_iov=queue_depth,
             cancel_level=CancelLevel.BOUNDED_TERMINAL,
         )

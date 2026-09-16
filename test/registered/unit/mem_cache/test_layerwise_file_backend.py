@@ -132,7 +132,6 @@ class _LayerwiseFixture:
             root=self.root,
             identity=self.identity,
             queue_depth=64,
-            max_inflight_bytes=1 << 26,
             alignment_profile=self.profile,
             require_direct_io=False,
         )

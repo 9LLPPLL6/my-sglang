@@ -1557,7 +1557,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
         self.assertEqual(parsed.hicache_storage_group_size, 1)
         self.assertEqual(parsed.hicache_storage_group_timeout_ms, 1000)
         self.assertEqual(parsed.hicache_storage_admission_budget_ms, 0)
-        self.assertEqual(parsed.hicache_storage_max_inflight_bytes, 1 << 30)
         self.assertEqual(parsed.hicache_storage_slow_fallback, "full_wait")
 
     def test_cli_parses_layerwise_knobs(self):
@@ -1577,8 +1576,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
                 "2500",
                 "--hicache-storage-admission-budget-ms",
                 "25",
-                "--hicache-storage-max-inflight-bytes",
-                "512Mi",
                 "--hicache-storage-slow-fallback",
                 "recompute",
             ]
@@ -1589,7 +1586,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
         self.assertEqual(parsed.hicache_storage_group_size, 4)
         self.assertEqual(parsed.hicache_storage_group_timeout_ms, 2500)
         self.assertEqual(parsed.hicache_storage_admission_budget_ms, 25)
-        self.assertEqual(parsed.hicache_storage_max_inflight_bytes, 512 << 20)
         self.assertEqual(parsed.hicache_storage_slow_fallback, "recompute")
 
     def test_full_wait_does_not_activate_layerwise_validation(self):
@@ -1599,7 +1595,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
             hicache_storage_group_size=0,
             hicache_storage_group_timeout_ms=0,
             hicache_storage_admission_budget_ms=-1,
-            hicache_storage_max_inflight_bytes=0,
             hicache_storage_slow_fallback="not-used",
         )
 
@@ -1612,7 +1607,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
                 hicache_storage_group_size=4,
                 hicache_storage_group_timeout_ms=2500,
                 hicache_storage_admission_budget_ms=0,
-                hicache_storage_max_inflight_bytes=512 << 20,
                 hicache_storage_slow_fallback="recompute",
             )
         )
@@ -1643,7 +1637,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
             ("hicache_storage_group_size", 0, "group-size"),
             ("hicache_storage_group_timeout_ms", 0, "group-timeout-ms"),
             ("hicache_storage_admission_budget_ms", -1, "admission-budget-ms"),
-            ("hicache_storage_max_inflight_bytes", 0, "max-inflight-bytes"),
         )
         for field, value, message in cases:
             with self.subTest(field=field):

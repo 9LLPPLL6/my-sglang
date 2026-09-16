@@ -130,7 +130,6 @@ class _ControllerFixture:
             root=self.root,
             identity=identity,
             queue_depth=64,
-            max_inflight_bytes=1 << 26,
             alignment_profile=profile,
             require_direct_io=False,
         )
@@ -143,7 +142,6 @@ class _ControllerFixture:
                 group_size=group_size,
                 group_timeout_s=30.0,
                 admission_budget_s=0.0,
-                max_inflight_bytes=1 << 26,
                 slow_fallback="full_wait",
             ),
             identity=identity,

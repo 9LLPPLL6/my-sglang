@@ -68,22 +68,16 @@ class IoArbiter:
         self,
         *,
         context: LinuxAioContext,
-        max_inflight_bytes: int,
         admission_reserved_slots: int = 2,
         write_share: float = 0.25,
         write_aging_s: float = 0.5,
     ):
-        if max_inflight_bytes <= 0:
-            raise ValueError(
-                f"max_inflight_bytes must be positive, got {max_inflight_bytes}"
-            )
         if not 0.0 < write_share <= 1.0:
             raise ValueError(f"write_share must be in (0, 1], got {write_share}")
         if admission_reserved_slots < 0:
             raise ValueError("admission_reserved_slots must be non-negative")
 
         self._context = context
-        self.max_inflight_bytes = max_inflight_bytes
         self.admission_reserved_slots = min(
             admission_reserved_slots, context.queue_depth
         )
@@ -111,11 +105,6 @@ class IoArbiter:
     ) -> None:
         if nbytes <= 0:
             raise ValueError(f"nbytes must be positive, got {nbytes}")
-        if nbytes > self.max_inflight_bytes:
-            raise ValueError(
-                f"a single {nbytes}-byte operation cannot fit the "
-                f"{self.max_inflight_bytes}-byte in-flight budget"
-            )
         item = _QueuedIo(
             fd=fd,
             ptr=ptr,
@@ -192,7 +181,6 @@ class IoArbiter:
         writes = []
         with self._lock:
             slots = self._context.free_slots
-            byte_budget = self.max_inflight_bytes - self._inflight_nbytes
             read_pending = any(
                 self._queues[priority]
                 for priority in (
@@ -207,8 +195,6 @@ class IoArbiter:
                 queue = self._queues[priority]
                 while queue and slots > 0:
                     item = queue[0]
-                    if item.nbytes > byte_budget:
-                        break
                     if item.is_write and write_slots <= 0:
                         break
                     if (
@@ -219,7 +205,6 @@ class IoArbiter:
                         break
                     queue.popleft()
                     slots -= 1
-                    byte_budget -= item.nbytes
                     if item.is_write:
                         write_slots -= 1
                         writes.append(item)

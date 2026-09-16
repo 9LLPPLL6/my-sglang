@@ -2899,19 +2899,6 @@ class ServerArgs:
         "select an automatic budget.",
         NS("memory"),
     ] = 0
-    hicache_storage_max_inflight_bytes: A[
-        int,
-        Arg(
-            help=(
-                "Maximum total bytes held by in-flight layerwise storage reads."
-                + f"\n\n{human_readable_int.__doc__}"
-            ),
-            type_parser=human_readable_int,
-        ),
-        NS("memory"),
-    ] = (
-        1 << 30
-    )
     hicache_storage_slow_fallback: A[
         str,
         Arg(
@@ -8276,10 +8263,6 @@ class ServerArgs:
             (
                 "--hicache-storage-group-timeout-ms",
                 cfg.hicache_storage_group_timeout_ms,
-            ),
-            (
-                "--hicache-storage-max-inflight-bytes",
-                cfg.hicache_storage_max_inflight_bytes,
             ),
         )
         for name, value in positive_fields:

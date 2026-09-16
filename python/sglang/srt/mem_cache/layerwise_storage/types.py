@@ -48,7 +48,6 @@ class LayerwiseBackendCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     supports_direct_to_host: bool
     max_inflight_groups: int
     max_inflight_extents: int
-    max_inflight_bytes: int
     max_iov: int
     cancel_level: CancelLevel
 
@@ -56,7 +55,6 @@ class LayerwiseBackendCapabilities(msgspec.Struct, frozen=True, kw_only=True):
         _require_positive("required_alignment", self.required_alignment)
         _require_positive("max_inflight_groups", self.max_inflight_groups)
         _require_positive("max_inflight_extents", self.max_inflight_extents)
-        _require_positive("max_inflight_bytes", self.max_inflight_bytes)
         _require_positive("max_iov", self.max_iov)
 
 
@@ -238,14 +236,11 @@ def validate_group_against_capabilities(
 ) -> None:
     """Reject a group the backend can never satisfy.
 
-    Group size is deliberately not checked against the queue depth or the
-    in-flight byte budget: those are per-submission windows that the I/O
-    arbiter drains in waves. Rejecting a group larger than one window would
-    disable streaming exactly where it pays most, since a long prefix expands
-    into more extents than any sane queue depth.
-
-    A single extent that cannot fit the whole byte budget is different -- it
-    could never be submitted at all -- and the arbiter rejects that on enqueue.
+    Group size is deliberately not checked against the queue depth: it is a
+    per-submission window that the I/O arbiter drains in waves. Rejecting a
+    group larger than one window would disable streaming exactly where it pays
+    most, since a long prefix expands into more extents than any sane queue
+    depth.
     """
     alignment = capabilities.required_alignment
     for extent in group.extents:

@@ -275,7 +275,6 @@ def main() -> None:
         root=args.root,
         identity=identity,
         queue_depth=args.queue_depth,
-        max_inflight_bytes=1 << 30,
         alignment_profile=profile,
         require_direct_io=not args.allow_buffered,
     )
