@@ -54,7 +54,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--first-group-layers", type=int, default=1)
     parser.add_argument("--group-size", type=int, default=4)
     parser.add_argument("--queue-depth", type=int, default=128)
-    parser.add_argument("--read-ahead-groups", type=int, default=2)
     parser.add_argument("--iters", type=int, default=5)
     parser.add_argument("--keep", action="store_true", help="keep the written pages")
     parser.add_argument(
@@ -183,9 +182,9 @@ def _bench_layerwise(*, backend, host, keys, layout, args):
                 remaining[completion.group_id] -= 1
         group0_latencies.append(time.perf_counter() - start)
 
-        # Steady state keeps read_ahead_groups + 1 groups in flight, which is
-        # what the pipeline does; a strictly serial loop would understate it.
-        window = args.read_ahead_groups + 1
+        # Steady state submits every remaining group at once, which is what
+        # the pipeline does; a strictly serial loop would understate it.
+        window = len(plan.groups)
         next_submit = 1
         outstanding = 0
         while next_submit < len(plan.groups) or outstanding > 0:

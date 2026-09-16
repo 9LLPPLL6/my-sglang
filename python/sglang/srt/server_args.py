@@ -2887,11 +2887,6 @@ class ServerArgs:
         "--hicache-storage-load-mode=layerwise.",
         NS("memory"),
     ] = 1
-    hicache_storage_read_ahead_groups: A[
-        int,
-        "Maximum number of unretired storage groups in one layerwise read window.",
-        NS("memory"),
-    ] = 1
     hicache_storage_group_timeout_ms: A[
         int,
         "Hard timeout in milliseconds for one layerwise storage group.",
@@ -8278,10 +8273,6 @@ class ServerArgs:
                 cfg.hicache_storage_first_group_layers,
             ),
             ("--hicache-storage-group-size", cfg.hicache_storage_group_size),
-            (
-                "--hicache-storage-read-ahead-groups",
-                cfg.hicache_storage_read_ahead_groups,
-            ),
             (
                 "--hicache-storage-group-timeout-ms",
                 cfg.hicache_storage_group_timeout_ms,

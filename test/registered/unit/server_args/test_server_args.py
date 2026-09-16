@@ -1555,7 +1555,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
         self.assertEqual(parsed.hicache_storage_load_mode, "full_wait")
         self.assertEqual(parsed.hicache_storage_first_group_layers, 1)
         self.assertEqual(parsed.hicache_storage_group_size, 1)
-        self.assertEqual(parsed.hicache_storage_read_ahead_groups, 1)
         self.assertEqual(parsed.hicache_storage_group_timeout_ms, 1000)
         self.assertEqual(parsed.hicache_storage_admission_budget_ms, 0)
         self.assertEqual(parsed.hicache_storage_max_inflight_bytes, 1 << 30)
@@ -1574,8 +1573,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
                 "1",
                 "--hicache-storage-group-size",
                 "4",
-                "--hicache-storage-read-ahead-groups",
-                "2",
                 "--hicache-storage-group-timeout-ms",
                 "2500",
                 "--hicache-storage-admission-budget-ms",
@@ -1590,7 +1587,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
         self.assertEqual(parsed.hicache_storage_load_mode, "layerwise")
         self.assertEqual(parsed.hicache_storage_first_group_layers, 1)
         self.assertEqual(parsed.hicache_storage_group_size, 4)
-        self.assertEqual(parsed.hicache_storage_read_ahead_groups, 2)
         self.assertEqual(parsed.hicache_storage_group_timeout_ms, 2500)
         self.assertEqual(parsed.hicache_storage_admission_budget_ms, 25)
         self.assertEqual(parsed.hicache_storage_max_inflight_bytes, 512 << 20)
@@ -1601,7 +1597,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
             hicache_storage_load_mode="full_wait",
             hicache_storage_first_group_layers=0,
             hicache_storage_group_size=0,
-            hicache_storage_read_ahead_groups=0,
             hicache_storage_group_timeout_ms=0,
             hicache_storage_admission_budget_ms=-1,
             hicache_storage_max_inflight_bytes=0,
@@ -1615,7 +1610,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
             **self._valid_layerwise_overrides(
                 hicache_storage_first_group_layers=1,
                 hicache_storage_group_size=4,
-                hicache_storage_read_ahead_groups=2,
                 hicache_storage_group_timeout_ms=2500,
                 hicache_storage_admission_budget_ms=0,
                 hicache_storage_max_inflight_bytes=512 << 20,
@@ -1647,7 +1641,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
         cases = (
             ("hicache_storage_first_group_layers", 0, "first-group-layers"),
             ("hicache_storage_group_size", 0, "group-size"),
-            ("hicache_storage_read_ahead_groups", 0, "read-ahead-groups"),
             ("hicache_storage_group_timeout_ms", 0, "group-timeout-ms"),
             ("hicache_storage_admission_budget_ms", -1, "admission-budget-ms"),
             ("hicache_storage_max_inflight_bytes", 0, "max-inflight-bytes"),

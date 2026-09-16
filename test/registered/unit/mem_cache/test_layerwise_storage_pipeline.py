@@ -180,7 +180,7 @@ class _DeferredConsensus(GroupConsensus):
 
 
 class _PipelineFixture:
-    def __init__(self, *, group_count=4, read_ahead_groups=2, consensus=None):
+    def __init__(self, *, group_count=4, consensus=None):
         self.backend = _FakeBackend()
         self.consensus = consensus or SingleRankConsensus()
         self.h2d_ranges: list[tuple[int, int]] = []
@@ -189,7 +189,6 @@ class _PipelineFixture:
             backend=self.backend,
             consensus=self.consensus,
             config=PipelineConfig(
-                read_ahead_groups=read_ahead_groups,
                 group_timeout_s=60.0,
                 admission_budget_s=0.0,
             ),
@@ -244,37 +243,59 @@ class TestLayerwiseStoragePipeline(CustomTestCase):
             fixture.transaction.machine.state, TransactionState.ADMISSION_READY
         )
 
-    def test_read_ahead_window_is_bounded_by_retirement(self):
-        read_ahead_groups = 2
-        fixture = _PipelineFixture(group_count=6, read_ahead_groups=read_ahead_groups)
-        limit = read_ahead_groups + 1
+    def test_read_ahead_is_continuous_once_group0_is_in_hand(self):
+        """Every remaining group goes out at once; retirement gates nothing.
 
-        def unretired() -> int:
-            return (
-                len(fixture.backend.submitted)
-                - fixture.transaction.machine.next_retire_group_id
-            )
+        The arbiter is the only backpressure now, so the pipeline hands it the
+        whole plan rather than metering submissions against a window.
+        """
+        fixture = _PipelineFixture(group_count=6)
+
+        self.assertEqual(
+            sorted(fixture.backend.submitted),
+            [0],
+            "group 0 is submitted alone because it gates admission",
+        )
 
         fixture.backend.complete_group(0)
         fixture.pipeline.advance(fixture.transaction)
-        self.assertEqual(sorted(fixture.backend.submitted), [0, 1, 2])
-        self.assertLessEqual(unretired(), limit)
+        self.assertEqual(
+            sorted(fixture.backend.submitted),
+            [0, 1, 2, 3, 4, 5],
+            "the rest of the plan follows group 0 without waiting for any "
+            "group to retire",
+        )
 
         fixture.admit()
-        for group_id in range(1, 5):
-            fixture.pipeline.advance(fixture.transaction)
-            self.assertLessEqual(
-                unretired(),
-                limit,
-                "an unretired group still holds staging and must count "
-                "against the window",
-            )
+        for group_id in range(1, 6):
             fixture.backend.complete_group(group_id)
-        fixture.pipeline.advance(fixture.transaction)
+            fixture.pipeline.advance(fixture.transaction)
         self.assertEqual(sorted(fixture.backend.submitted), [0, 1, 2, 3, 4, 5])
 
+    def test_only_the_frontier_group_arms_the_timeout(self):
+        """A group queued behind a healthy frontier has no running clock.
+
+        With continuous read-ahead every group is submitted at once, so a
+        submit-time clock would fire on groups that are merely waiting their
+        turn. At most one group -- the retirement frontier -- is ever timed.
+        """
+        fixture = _PipelineFixture(group_count=4)
+
+        fixture.backend.complete_group(0)
+        fixture.pipeline.advance(fixture.transaction)
+        fixture.admit()
+        fixture.pipeline.advance(fixture.transaction)
+
+        self.assertEqual(sorted(fixture.backend.submitted), [0, 1, 2, 3])
+        self.assertLessEqual(
+            len(fixture.transaction.group_deadlines),
+            1,
+            "only the frontier group may hold a deadline",
+        )
+        self.assertFalse(fixture.transaction.aborted)
+
     def test_h2d_follows_plan_order_even_when_storage_does_not(self):
-        fixture = _PipelineFixture(group_count=4, read_ahead_groups=4)
+        fixture = _PipelineFixture(group_count=4)
 
         fixture.backend.complete_group(0)
         fixture.pipeline.advance(fixture.transaction)
@@ -308,7 +329,7 @@ class TestLayerwiseStoragePipeline(CustomTestCase):
         self.assertIn("peer rank", fixture.transaction.error)
 
     def test_local_read_failure_aborts_and_cancels_only_submitted_groups(self):
-        fixture = _PipelineFixture(group_count=4, read_ahead_groups=3)
+        fixture = _PipelineFixture(group_count=4)
 
         fixture.backend.complete_group(0)
         fixture.pipeline.advance(fixture.transaction)
@@ -328,7 +349,7 @@ class TestLayerwiseStoragePipeline(CustomTestCase):
             self.assertIs(group.state, GroupState.CANCELLED)
 
     def test_staging_is_not_freed_while_a_read_can_still_write_to_it(self):
-        fixture = _PipelineFixture(group_count=2, read_ahead_groups=2)
+        fixture = _PipelineFixture(group_count=2)
 
         fixture.backend.complete_group(0)
         fixture.pipeline.advance(fixture.transaction)
@@ -349,7 +370,7 @@ class TestLayerwiseStoragePipeline(CustomTestCase):
         self.assertFalse(fixture.backend.closed)
 
     def test_successful_transaction_resolves_each_allocation_exactly_once(self):
-        fixture = _PipelineFixture(group_count=2, read_ahead_groups=2)
+        fixture = _PipelineFixture(group_count=2)
 
         fixture.backend.complete_group(0)
         fixture.pipeline.advance(fixture.transaction)
@@ -384,7 +405,6 @@ class TestLayerwiseStoragePipeline(CustomTestCase):
                 backend=backend,
                 consensus=SingleRankConsensus(),
                 config=PipelineConfig(
-                    read_ahead_groups=1,
                     group_timeout_s=1.0,
                     admission_budget_s=0.0,
                 ),
@@ -397,7 +417,6 @@ class TestLayerwiseStoragePipeline(CustomTestCase):
             backend=backend,
             consensus=SingleRankConsensus(),
             config=PipelineConfig(
-                read_ahead_groups=1,
                 group_timeout_s=-1.0,
                 admission_budget_s=0.0,
             ),

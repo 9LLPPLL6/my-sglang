@@ -51,7 +51,6 @@ _READ_AHEAD_PRIORITY = 2
 
 
 class PipelineConfig(NamedTuple):
-    read_ahead_groups: int
     group_timeout_s: float
     admission_budget_s: float
 
@@ -121,8 +120,6 @@ class LayerwiseStoragePipeline:
     ):
         capabilities = backend.capabilities()
         _reject_unusable_backend(capabilities)
-        if config.read_ahead_groups < 1:
-            raise ValueError("read_ahead_groups must be at least 1")
 
         self._backend = backend
         self._consensus = consensus
@@ -258,14 +255,11 @@ class LayerwiseStoragePipeline:
     ) -> None:
         group_machine = transaction.machine.group(group_id)
         group_machine.submit()
-        transaction.group_deadlines[group_id] = (
-            time.monotonic() + self._config.group_timeout_s
-        )
         self._backend.submit_group(
             handle=transaction.handle,
             group=transaction.plan.groups[group_id],
             priority=priority,
-            deadline_s=transaction.group_deadlines[group_id],
+            deadline_s=transaction.group_deadlines.get(group_id),
         )
         transaction.next_submit_group_id = max(
             transaction.next_submit_group_id, group_id + 1
@@ -288,17 +282,31 @@ class LayerwiseStoragePipeline:
             )
 
     def _enforce_deadlines(self, transaction: LayerwiseTransaction) -> None:
+        """Watchdog the group at the retirement frontier, and only that one.
+
+        With continuous read-ahead every remaining group is submitted at once,
+        so a submit-time clock would fire on groups that are merely queued
+        behind a healthy frontier rather than stuck. The frontier group is the
+        one nothing can hide, and every group becomes the frontier in turn, so
+        arming it there still catches a stalled read -- just not before the
+        reader actually needs that group.
+        """
+        frontier_id = transaction.machine.next_retire_group_id
+        if frontier_id >= transaction.group_count:
+            return
+        group = transaction.machine.group(frontier_id)
+        if group.state is not GroupState.SUBMITTED:
+            return
         now = time.monotonic()
-        for group in transaction.machine.groups:
-            if group.state is not GroupState.SUBMITTED:
-                continue
-            deadline = transaction.group_deadlines.get(group.plan.group_id)
-            if deadline is not None and now > deadline:
-                self.abort(
-                    transaction,
-                    reason=f"group {group.plan.group_id} exceeded its storage timeout",
-                )
-                return
+        deadline = transaction.group_deadlines.get(frontier_id)
+        if deadline is None:
+            deadline = now + self._config.group_timeout_s
+            transaction.group_deadlines[frontier_id] = deadline
+        if now > deadline:
+            self.abort(
+                transaction,
+                reason=f"group {frontier_id} exceeded its storage timeout",
+            )
 
     def _advance_consensus(self, transaction: LayerwiseTransaction) -> None:
         """Start agreement in group order, then collect whatever is decided."""
@@ -347,24 +355,22 @@ class LayerwiseStoragePipeline:
         transaction.machine.retire_ready_groups()
 
     def _advance_read_ahead(self, transaction: LayerwiseTransaction) -> None:
-        """Keep the read window full without letting it outrun the budget.
+        """Submit every remaining group once group 0 is in hand.
 
-        The window is measured against retirement rather than submission: a
-        group whose bytes are still in flight is still holding staging, so
-        counting only submissions would let the window grow without bound.
-        ``read_ahead_groups`` counts groups read *ahead of* the one at the
-        retirement frontier, so the in-flight limit is one larger.
+        Read-ahead is continuous and has no group-count window: the reader runs
+        to the end of the transaction and the arbiter is the only backpressure,
+        throttling on its in-flight byte budget and queue depth. Submission is
+        cheap -- it appends to the arbiter's priority queue -- so the cost of
+        running the whole plan ahead is bounded by what the arbiter admits, not
+        by how many groups have been handed to it.
+
+        The group timeout is armed at the retirement frontier rather than here
+        (see ``_enforce_deadlines``): a group queued behind the frontier can
+        legitimately wait far longer than one group's timeout.
         """
         if not transaction.admission_ready and not self._group0_local_done(transaction):
             return
-        window = self._config.read_ahead_groups + 1
         while transaction.next_submit_group_id < transaction.group_count:
-            inflight = (
-                transaction.next_submit_group_id
-                - transaction.machine.next_retire_group_id
-            )
-            if inflight >= window:
-                break
             self._submit_group(
                 transaction,
                 group_id=transaction.next_submit_group_id,

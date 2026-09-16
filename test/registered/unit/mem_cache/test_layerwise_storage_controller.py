@@ -107,7 +107,7 @@ def _make_identity() -> PageIdentity:
 
 
 class _ControllerFixture:
-    def __init__(self, *, first_group_layers=1, group_size=2, read_ahead_groups=2):
+    def __init__(self, *, first_group_layers=1, group_size=2):
         self.root = tempfile.mkdtemp(prefix="sglang-layerwise-ctl-")
         probed = probe_alignment(self.root, require_direct=False)
         profile = AlignmentProfile(
@@ -141,7 +141,6 @@ class _ControllerFixture:
                 root=self.root,
                 first_group_layers=first_group_layers,
                 group_size=group_size,
-                read_ahead_groups=read_ahead_groups,
                 group_timeout_s=30.0,
                 admission_budget_s=0.0,
                 max_inflight_bytes=1 << 26,

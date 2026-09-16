@@ -225,7 +225,6 @@ python -m sglang.launch_server \
   --hicache-storage-load-mode layerwise \
   --hicache-storage-first-group-layers 1 \
   --hicache-storage-group-size 8 \
-  --hicache-storage-read-ahead-groups 2 \
   --hicache-io-backend direct \
   --hicache-mem-layout page_first_direct \
   --hicache-write-policy write_through \
@@ -235,12 +234,14 @@ python -m sglang.launch_server \
   --page-size 64
 ```
 
-三个旋钮的含义：
+两个旋钮的含义：
 
 - `first-group-layers=1`：第 0 组只放 1 层。它是唯一藏不住的，越小越好。
 - `group-size=8`：后续每组 8 层。太小则每个 I/O 请求太碎（阶段 01 测过：
   2 层只能拿到裸带宽的 53%，8 层能到 94%）。
-- `read-ahead-groups=2`：往前预读 2 组。在途组数上限是这个值 +1。
+
+> 注：`read-ahead-groups` 已在分支 `L2-L3fusion-continuous-read` 上移除，
+> 预读改为无窗口的连续提交，由 I/O 仲裁器的字节预算和队列深度做唯一背压。
 
 启动日志里应该看到：
 

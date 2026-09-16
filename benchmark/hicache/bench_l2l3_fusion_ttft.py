@@ -350,7 +350,6 @@ def server_spec(server: str, args, port: int) -> tuple[list[str], dict]:
             "--hicache-storage-load-mode", "layerwise",
             "--hicache-storage-first-group-layers", str(args.first_group_layers),
             "--hicache-storage-group-size", str(args.group_size),
-            "--hicache-storage-read-ahead-groups", str(args.read_ahead_groups),
             "--hicache-storage-group-timeout-ms", str(args.group_timeout_ms),
         ]
     else:
@@ -961,7 +960,6 @@ def parse_args():
                         "caps how much a parallel backend can have in flight")
     p.add_argument("--first-group-layers", type=int, default=1)
     p.add_argument("--group-size", type=int, default=8)
-    p.add_argument("--read-ahead-groups", type=int, default=2)
     p.add_argument("--group-timeout-ms", type=int, default=1000,
                    help="--hicache-storage-group-timeout-ms. A group that misses "
                         "it aborts the transaction mid-forward and, with no "

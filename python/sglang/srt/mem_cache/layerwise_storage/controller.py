@@ -55,7 +55,6 @@ class LayerwiseControllerConfig(NamedTuple):
     root: str
     first_group_layers: int
     group_size: int
-    read_ahead_groups: int
     group_timeout_s: float
     admission_budget_s: float
     max_inflight_bytes: int
@@ -102,7 +101,6 @@ class LayerwiseStorageController:
             backend=self.backend,
             consensus=consensus,
             config=PipelineConfig(
-                read_ahead_groups=config.read_ahead_groups,
                 group_timeout_s=config.group_timeout_s,
                 admission_budget_s=config.admission_budget_s,
             ),
@@ -133,7 +131,6 @@ class LayerwiseStorageController:
             root=backend.root,
             first_group_layers=server_args.hicache_storage_first_group_layers,
             group_size=server_args.hicache_storage_group_size,
-            read_ahead_groups=server_args.hicache_storage_read_ahead_groups,
             group_timeout_s=server_args.hicache_storage_group_timeout_ms / 1000.0,
             admission_budget_s=(
                 server_args.hicache_storage_admission_budget_ms / 1000.0

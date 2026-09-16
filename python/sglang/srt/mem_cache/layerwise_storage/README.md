@@ -157,7 +157,6 @@ Path layout — the directory tree partitions only on what it must:
 --hicache-storage-load-mode layerwise
 --hicache-storage-first-group-layers 1          # the one group nothing can hide
 --hicache-storage-group-size 8
---hicache-storage-read-ahead-groups 2           # in-flight groups = this + 1
 --disable-overlap-schedule
 --chunked-prefill-size -1
 
