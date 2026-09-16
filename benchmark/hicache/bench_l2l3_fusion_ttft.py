@@ -42,6 +42,7 @@ import ctypes
 import json
 import os
 import random
+import re
 import shutil
 import statistics
 import subprocess
@@ -71,6 +72,10 @@ _MAP_FAILED = ctypes.c_void_p(-1).value
 _LOW_BIT = bytes(i & 1 for i in range(256))
 
 ARMS = ("l1", "l2", "l2_fused", "l3_old", "l3_nopipe", "l3_fused")
+# `l3_nopipe_t<N>` is the same arm at --hicache-storage-io-threads=N. Each N is
+# its own server (the flag is a startup argument), and each gets its own store
+# so one thread count can never read pages another one left in a cache.
+_NOPIPE_THREADS = re.compile(r"^l3_nopipe_t(\d+)$")
 SERVER_OF_ARM = {
     "l1": "mem",
     "l2": "mem",
@@ -80,6 +85,30 @@ SERVER_OF_ARM = {
     "l2_fused": "l3_fused",
 }
 STORE_OF_SERVER = {"l3_old": "file", "l3_nopipe": "layerwise", "l3_fused": "layerwise"}
+
+
+def arm_is_known(arm: str) -> bool:
+    return arm in ARMS or _NOPIPE_THREADS.match(arm) is not None
+
+
+def server_of_arm(arm: str) -> str:
+    # One server per thread count, named after the arm it serves.
+    return arm if _NOPIPE_THREADS.match(arm) else SERVER_OF_ARM[arm]
+
+
+def store_of_server(server: str) -> str | None:
+    if _NOPIPE_THREADS.match(server):
+        return f"layerwise-{server}"
+    return STORE_OF_SERVER.get(server)
+
+
+def io_threads_of_server(server: str, default: int) -> int:
+    match = _NOPIPE_THREADS.match(server)
+    return int(match.group(1)) if match else default
+
+
+def is_nopipe(arm: str) -> bool:
+    return arm == "l3_nopipe" or _NOPIPE_THREADS.match(arm) is not None
 
 
 def log(msg: str) -> None:
@@ -277,6 +306,7 @@ def base_args(args, port: int) -> list[str]:
         "--disable-flashinfer-autotune",
         "--chunked-prefill-size", "-1",
         "--max-prefill-tokens", str(args.max_prefill_tokens),
+        *(["--context-length", str(args.context_length)] if args.context_length else []),
         "--max-total-tokens", str(args.max_total_tokens),
         "--max-running-requests", "1",
         "--mem-fraction-static", str(args.mem_fraction_static),
@@ -306,6 +336,15 @@ def server_spec(server: str, args, port: int) -> tuple[list[str], dict]:
         return argv, env
 
     argv += ["--hicache-storage-backend", "layerwise_file"]
+    if server.startswith("l3_nopipe"):
+        argv += ["--hicache-storage-load-mode", "full_wait",
+                 "--hicache-storage-io-threads",
+                 str(io_threads_of_server(server, args.io_threads))]
+        env["SGLANG_HICACHE_LAYERWISE_ROOT"] = str(
+            Path(args.store_root) / store_of_server(server))
+        env["SGLANG_HICACHE_LAYERWISE_MAX_SIZE"] = args.store_max_size
+        env["SGLANG_HICACHE_LAYERWISE_MIN_FREE_SPACE"] = args.store_min_free
+        return argv, env
     if server == "l3_fused":
         argv += [
             "--hicache-storage-load-mode", "layerwise",
@@ -332,6 +371,14 @@ def launch(server: str, args, port: int, log_path: Path):
     env = dict(os.environ)
     env["PYTHONPATH"] = REPO_PY + (":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     env["SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"] = "1"
+    if args.context_length:
+        # H+S can exceed the checkpoint's trained context. RoPE then extrapolates
+        # on the tail positions, which changes what the model would say -- and
+        # nothing about the storage path, the KV byte count, or the timings this
+        # benchmark reports.
+        env["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
+    if args.storage_batch_size:
+        env["SGLANG_HICACHE_STORAGE_BATCH_SIZE"] = str(args.storage_batch_size)
     # The JIT kernels shell out to nvcc, and /usr/bin/nvcc is CUDA 12.0, which
     # cannot target sm_120a. Put a CUDA 13 toolkit matching torch ahead of it.
     env["PATH"] = (os.path.expanduser("~/.local/bin") + ":" + args.cuda_bin_dir
@@ -477,6 +524,101 @@ def evict_device(port: int, args, rng: random.Random) -> int:
     return pushed
 
 
+# Match the whole log line so the rank tag can be read off it. An optional
+# leading group would not work: the engine simply skips it and every line comes
+# back as rank 0, which is exactly the collapse this parsing has to avoid.
+_READ_LINE = re.compile(
+    r"^.*layerwise_file read: pages=(\d+) bytes=(\d+) ms=([\d.]+) "
+    r"open_ms=([\d.]+) io_ms=([\d.]+) GiB/s=([\d.]+) threads=(\d+).*$",
+    re.MULTILINE,
+)
+_RANK_TAG = re.compile(r"TP(\d+)\]")
+
+
+def read_lines_since(log_path: Path, offset: int) -> tuple[list[dict], int]:
+    """Parse the backend's per-batch read reports appended since ``offset``.
+
+    The backend is the only place that sees both the bytes and the wall time of
+    the storage read; differencing two TTFTs can only bound it. Reading by byte
+    offset keeps a measurement's batches separate from the warm-up's.
+    """
+    with log_path.open("rb") as handle:
+        handle.seek(offset)
+        chunk = handle.read()
+        end = handle.tell()
+    rows = []
+    for match in _READ_LINE.finditer(chunk.decode("utf-8", "replace")):
+        pages, nbytes, ms, open_ms, io_ms, gibps, threads = match.groups()
+        rank_tag = _RANK_TAG.search(match.group(0))
+        rows.append({"rank": int(rank_tag.group(1)) if rank_tag else 0,
+                     "pages": int(pages), "bytes": int(nbytes), "ms": float(ms),
+                     "open_ms": float(open_ms), "io_ms": float(io_ms),
+                     "gibps": float(gibps), "threads": int(threads)})
+    return rows, end
+
+
+def summarize_reads(rows: list[dict]) -> dict:
+    """Fold one request's batches into a single L3 -> L2 transfer figure.
+
+    The controller runs batches one after another on a single thread, so the
+    per-batch times add up to the transfer's wall time rather than overlapping.
+    """
+    if not rows:
+        return {}
+    # Every TP rank reads its own shard of the same prefix, concurrently, into
+    # its own host pool. Batches WITHIN a rank are serial and add up; the ranks
+    # themselves overlap, so the request waits for the slowest of them. Summing
+    # across ranks would report a two-rank read as taking twice as long as it
+    # does, and would divide two ranks' bytes by two ranks' seconds -- which
+    # silently yields the per-rank rate while looking like an aggregate.
+    per_rank: dict[int, dict] = {}
+    for row in rows:
+        acc = per_rank.setdefault(row["rank"], {"ms": 0.0, "open_ms": 0.0,
+                                                "io_ms": 0.0, "bytes": 0, "pages": 0,
+                                                "batches": 0})
+        for field in ("ms", "open_ms", "io_ms", "bytes", "pages"):
+            acc[field] += row[field]
+        acc["batches"] += 1
+
+    critical = max(per_rank.values(), key=lambda a: a["ms"])
+    total_bytes = sum(a["bytes"] for a in per_rank.values())
+    rank_gibps = [a["bytes"] / (1 << 30) / (a["io_ms"] / 1e3)
+                  for a in per_rank.values() if a["io_ms"] > 0]
+    return {
+        "ranks": len(per_rank),
+        "batches_per_rank": critical["batches"],
+        "l3_pages": sum(a["pages"] for a in per_rank.values()),
+        "l3_bytes": total_bytes,
+        # The slowest rank's wall clock: what the request actually waits for.
+        "l3_ms": round(critical["ms"], 2),
+        "l3_open_ms": round(critical["open_ms"], 2),
+        "l3_io_ms": round(critical["io_ms"], 2),
+        # Per rank, transfer only -- the figure that describes one rank's share
+        # of the storage, and the one that has to scale with io_threads.
+        "l3_gibps": round(statistics.median(rank_gibps), 2) if rank_gibps else 0.0,
+        # Every rank's bytes over the critical path: what the filesystem as a
+        # whole delivered to this request.
+        "l3_agg_gibps": (round(total_bytes / (1 << 30) / (critical["io_ms"] / 1e3), 2)
+                         if critical["io_ms"] else 0.0),
+    }
+
+
+def warm_prefix(port: int, prefix: list[int], rng: random.Random, step: int) -> int:
+    """Write the prefix into the store, extending it a step at a time.
+
+    One 131k-token prefill would be a different experiment: it needs a prefill
+    budget and an activation footprint the measured request never uses. Growing
+    the prefix in steps keeps every prefill small, and each step is still a cold
+    miss that writes -- it never reads the store, so it cannot warm any cache
+    under the timed read.
+    """
+    sent = 0
+    while sent < len(prefix):
+        sent = min(sent + step, len(prefix))
+        generate(port, prefix[:sent] + gen_ids(8, rng))
+    return sent
+
+
 def measure(arm: str, port: int, proc, prefix: list[int], suffix_len: int,
             args, rng: random.Random, store_root, log_path: Path) -> dict:
     prep: dict = {}
@@ -487,8 +629,9 @@ def measure(arm: str, port: int, proc, prefix: list[int], suffix_len: int,
     # miss that WRITES the prefix. It never pre-reads the store, so it cannot
     # warm the page cache under the timed read.
     before_store = store_bytes(store_root)[0] if store_root is not None else 0
-    warm = generate(port, prefix + gen_ids(8, rng))
-    prep["warm_tier"] = tier(warm["meta"])
+    warm_started = time.perf_counter()
+    warm_prefix(port, prefix, rng, args.warm_step)
+    prep["warm_ms"] = round((time.perf_counter() - warm_started) * 1e3, 1)
 
     if store_root is not None:
         # Gate on the GROWTH this warm-up caused, not on an absolute size: the
@@ -509,16 +652,20 @@ def measure(arm: str, port: int, proc, prefix: list[int], suffix_len: int,
 
     before_io = tree_read_bytes(proc.pid)
     before_log = log_counts(log_path)
+    log_offset = log_path.stat().st_size
     res = generate(port, prefix + (gen_ids(suffix_len, rng) if suffix_len else []))
     read_delta = tree_read_bytes(proc.pid) - before_io
     after_log = log_counts(log_path)
+    reads, _ = read_lines_since(log_path, log_offset)
 
-    return {"arm": arm, "hit_tokens": len(prefix), "suffix_tokens": suffix_len,
-            "ttft_ms": round(res["ttft_ms"], 1), "tier": tier(res["meta"]),
-            "disk_read_bytes": read_delta, "expect_kv_bytes": expect_kv,
-            "disk_read_frac": round(read_delta / expect_kv, 3),
-            "log_delta": {k: after_log[k] - before_log.get(k, 0) for k in after_log},
-            "prep": prep}
+    rec = {"arm": arm, "hit_tokens": len(prefix), "suffix_tokens": suffix_len,
+           "ttft_ms": round(res["ttft_ms"], 1), "tier": tier(res["meta"]),
+           "disk_read_bytes": read_delta, "expect_kv_bytes": expect_kv,
+           "disk_read_frac": round(read_delta / expect_kv, 3),
+           "log_delta": {k: after_log[k] - before_log.get(k, 0) for k in after_log},
+           "prep": prep}
+    rec.update(summarize_reads(reads))
+    return rec
 
 
 def validate(arm: str, rec: dict) -> str | None:
@@ -601,8 +748,8 @@ def run(args) -> Path:
 
     arms = [a for a in args.arms.split(",") if a]
     for a in arms:
-        if a not in ARMS:
-            raise SystemExit(f"unknown arm {a}; pick from {ARMS}")
+        if not arm_is_known(a):
+            raise SystemExit(f"unknown arm {a}; pick from {ARMS} or l3_nopipe_t<N>")
     suffixes = [int(s) for s in args.suffixes.split(",")]
     # H changes nothing about how a server is launched, so every cached-prefix
     # length is swept inside one server rather than costing its own model load.
@@ -610,15 +757,15 @@ def run(args) -> Path:
 
     by_server: dict = {}
     for a in arms:
-        by_server.setdefault(SERVER_OF_ARM[a], []).append(a)
+        by_server.setdefault(server_of_arm(a), []).append(a)
 
     rng = random.Random(args.seed)
     counter = 0
     for server, server_arms in by_server.items():
         log_path = run_dir / f"server-{server}.log"
         store_root = None
-        if server in STORE_OF_SERVER:
-            store_root = Path(args.store_root) / STORE_OF_SERVER[server]
+        if store_of_server(server) is not None:
+            store_root = Path(args.store_root) / store_of_server(server)
             shutil.rmtree(store_root, ignore_errors=True)
             store_root.mkdir(parents=True, exist_ok=True)
 
@@ -639,8 +786,13 @@ def run(args) -> Path:
                             records.write(json.dumps(rec) + "\n")
                             records.flush()
                             flag = "" if rec["complaint"] is None else f"  !! {rec['complaint']}"
-                            log(f"{arm:9s} H={h:<6d} S={s:<5d} hit={h/(h+s):6.2%} "
-                                f"TTFT={rec['ttft_ms']:8.1f} ms  "
+                            l3 = (f"L3->L2={rec['l3_ms']:7.1f} ms "
+                                  f"(open {rec['l3_open_ms']:6.1f} + io {rec['l3_io_ms']:7.1f}) "
+                                  f"{rec['l3_gibps']:6.2f} GiB/s/rank "
+                                  f"({rec['l3_agg_gibps']:6.2f} agg)  "
+                                  if rec.get("l3_ms") else "")
+                            log(f"{arm:13s} H={h:<7d} S={s:<5d} "
+                                f"TTFT={rec['ttft_ms']:8.1f} ms  {l3}"
                                 f"disk={rec['disk_read_frac']:.2f}x  "
                                 f"tier(d/h/s)={t3(rec['tier'])}{flag}")
         finally:
@@ -658,12 +810,25 @@ def summarize(run_dir: Path) -> None:
 
     cells: dict = {}
     disk: dict = {}
+    l3ms: dict = {}
+    l3bw: dict = {}
+    l3open: dict = {}
+    l3io: dict = {}
     for r in good:
         key = (r["arm"], r["hit_tokens"], r["suffix_tokens"])
         cells.setdefault(key, []).append(r["ttft_ms"])
         disk.setdefault(key, []).append(r["disk_read_frac"])
+        if r.get("l3_ms"):
+            l3ms.setdefault(key, []).append(r["l3_ms"])
+            l3bw.setdefault(key, []).append(r["l3_gibps"])
+            l3open.setdefault(key, []).append(r["l3_open_ms"])
+            l3io.setdefault(key, []).append(r["l3_io_ms"])
 
-    arms = [a for a in ARMS if any(k[0] == a for k in cells)]
+    seen = {k[0] for k in cells}
+    # Keep the canonical order, then append the l3_nopipe_t<N> family by N.
+    arms = [a for a in ARMS if a in seen]
+    arms += sorted((a for a in seen if _NOPIPE_THREADS.match(a)),
+                   key=lambda a: int(_NOPIPE_THREADS.match(a).group(1)))
     hits = sorted({k[1] for k in cells})
     combos = sorted({(k[1], k[2]) for k in cells})
 
@@ -690,6 +855,21 @@ def summarize(run_dir: Path) -> None:
           lambda a, h, s: (f"{med(a, h, s, disk):>11.2f}"
                            if med(a, h, s, disk) is not None else f"{'-':>11}"))
 
+    if l3ms:
+        l3_arms = [a for a in arms if any(k[0] == a for k in l3ms)]
+        block("L3 -> L2 transfer, measured inside the backend (ms)", l3_arms,
+              lambda a, h, s: (f"{med(a, h, s, l3ms):>11.0f}"
+                               if med(a, h, s, l3ms) is not None else f"{'-':>11}"))
+        block("  of which page open() (ms)", l3_arms,
+              lambda a, h, s: (f"{med(a, h, s, l3open):>11.0f}"
+                               if med(a, h, s, l3open) is not None else f"{'-':>11}"))
+        block("  of which transfer (ms)", l3_arms,
+              lambda a, h, s: (f"{med(a, h, s, l3io):>11.0f}"
+                               if med(a, h, s, l3io) is not None else f"{'-':>11}"))
+        block("L3 read bandwidth per rank, transfer only (GiB/s)", l3_arms,
+              lambda a, h, s: (f"{med(a, h, s, l3bw):>11.2f}"
+                               if med(a, h, s, l3bw) is not None else f"{'-':>11}"))
+
     for ref in ("l2", "l2_fused"):
         if ref not in arms:
             continue
@@ -711,7 +891,7 @@ def summarize(run_dir: Path) -> None:
         print()
         print(f"{len(bad)} record(s) rejected:")
         for r in bad:
-            print(f"  {r['arm']:9s} H={r['hit_tokens']:<6d} S={r['suffix_tokens']:<6d} "
+            print(f"  {r['arm']:13s} H={r['hit_tokens']:<7d} S={r['suffix_tokens']:<6d} "
                   f"{r['complaint']}")
 
 
@@ -766,6 +946,19 @@ def parse_args():
                         "contexts; a parallel filesystem needs it to reach its "
                         "aggregate bandwidth. Refused by the layerwise path, so "
                         "it is passed to the full_wait server only")
+    p.add_argument("--warm-step", type=int, default=16384,
+                   help="grow the prefix this many tokens per warm-up request. "
+                        "Keeps every write-phase prefill small enough to stay "
+                        "inside --max-prefill-tokens for a very long prefix")
+    p.add_argument("--context-length", type=int, default=0,
+                   help="override the model's context length (0 = leave it). "
+                        "Needed when H+S exceeds what the checkpoint was trained "
+                        "for; it changes generated text, not the storage path")
+    p.add_argument("--storage-batch-size", type=int, default=0,
+                   help="SGLANG_HICACHE_STORAGE_BATCH_SIZE: pages per batched "
+                        "storage call (0 = leave the 128 default). The controller "
+                        "waits for each batch before starting the next, so this "
+                        "caps how much a parallel backend can have in flight")
     p.add_argument("--first-group-layers", type=int, default=1)
     p.add_argument("--group-size", type=int, default=8)
     p.add_argument("--read-ahead-groups", type=int, default=2)
