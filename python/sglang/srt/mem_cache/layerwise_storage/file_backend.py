@@ -17,6 +17,7 @@ import itertools
 import logging
 import os
 import threading
+import time
 from typing import Any, NamedTuple, Optional
 
 from sglang.srt.mem_cache.layerwise_storage.aio_engine import (
@@ -97,6 +98,7 @@ class BouncePool:
 
 class _InflightExtent(NamedTuple):
     transaction_id: str
+    page_key: str
     generation: int
     group_id: int
     extent_id: int
@@ -146,6 +148,16 @@ class _ReadHandleState:
         self.plan = plan
         self.target = target
         self.shard_of_page: dict[str, int] = {}
+        # Read accounting, reported once at close. The whole-prefix backend has
+        # always logged this; without the same line here the streaming path's
+        # bandwidth is simply unobservable, and its share of an exposed TTFT can
+        # only be inferred from the other path's numbers.
+        self.bytes_done = 0
+        self.extents_done = 0
+        self.open_ns = 0
+        self.first_submit_s = 0.0
+        self.last_complete_s = 0.0
+        self.shard_bytes: dict[int, int] = {}
         self.submitted_groups: set[int] = set()
         self.pending_extents = 0
         self.completions: list[LayerwiseStorageCompletion] = []
@@ -369,6 +381,37 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
                     f"{state.pending_extents} operations that can touch its target"
                 )
             del self._handles[handle.transaction_id]
+        self._report_read(handle.transaction_id, state)
+
+    def _report_read(self, transaction_id: str, state: _ReadHandleState) -> None:
+        """One line per transaction, shaped like the whole-prefix backend's.
+
+        The span is first submission to last completion, so it covers the
+        pipeline's group-by-group pacing as well as the I/O -- which is the
+        point: the gap between this GiB/s and the device's is what the pacing
+        costs.
+        """
+        if state.extents_done == 0 or state.last_complete_s <= state.first_submit_s:
+            return
+        span_s = state.last_complete_s - state.first_submit_s
+        open_ms = state.open_ns / 1e6
+        shards = ",".join(
+            f"{index}:{state.shard_bytes.get(index, 0)}"
+            for index in range(self._io_threads)
+        )
+        logger.info(
+            "layerwise_stream read: txn=%s pages=%d extents=%d bytes=%d "
+            "ms=%.2f open_ms=%.2f GiB/s=%.2f threads=%d shard_bytes=%s",
+            transaction_id,
+            len(state.shard_of_page),
+            state.extents_done,
+            state.bytes_done,
+            span_s * 1e3,
+            open_ms,
+            state.bytes_done / span_s / (1 << 30),
+            self._io_threads,
+            shards,
+        )
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -416,6 +459,7 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
             or extent.payload_nbytes != extent.io_nbytes
             or target_ptr % memory_alignment != 0
         )
+        open_started = time.perf_counter_ns()
         try:
             fd = self._files.acquire(
                 path, direct=self.alignment_profile.direct_io_available
@@ -436,6 +480,7 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
         user_data = next(self._user_data)
         record = _InflightExtent(
             transaction_id=handle.transaction_id,
+            page_key=extent.storage_key,
             generation=handle.generation,
             group_id=group_id,
             extent_id=extent.extent_id,
@@ -448,7 +493,12 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
         )
         with self._lock:
             self._inflight[user_data] = record
-        shard = self._shards[state.shard_of_page.get(extent.storage_key, 0)]
+        shard_index = state.shard_of_page.get(extent.storage_key, 0)
+        with self._lock:
+            state.open_ns += time.perf_counter_ns() - open_started
+            if state.first_submit_s == 0.0:
+                state.first_submit_s = time.perf_counter()
+        shard = self._shards[shard_index]
         shard.arbiter.enqueue(
             fd=fd,
             ptr=bounce.ptr if bounce is not None else target_ptr,
@@ -535,6 +585,14 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
             if record is None:
                 return
             state = self._handles.get(record.transaction_id)
+            if state is not None and status is ExtentCompletionStatus.SUCCEEDED:
+                state.bytes_done += bytes_transferred
+                state.extents_done += 1
+                state.last_complete_s = time.perf_counter()
+                shard_index = state.shard_of_page.get(record.page_key, 0)
+                state.shard_bytes[shard_index] = (
+                    state.shard_bytes.get(shard_index, 0) + bytes_transferred
+                )
         self._files.release(record.path)
         if record.bounce is not None:
             self._bounce.release(record.bounce)

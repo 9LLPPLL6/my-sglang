@@ -355,11 +355,10 @@ def server_spec(server: str, args, port: int) -> tuple[list[str], dict]:
         ]
     else:
         argv += ["--hicache-storage-load-mode", "full_wait"]
-        # Parallel submission belongs to the whole-prefix read path only; the
-        # streaming controller has its own single-context submitter and the
-        # server refuses the combination rather than ignoring it.
-        if args.io_threads > 1:
-            argv += ["--hicache-storage-io-threads", str(args.io_threads)]
+    # Sharded submission applies to both read paths now; it used to be refused
+    # on the streaming one, which left the pipeline reading single-context.
+    if args.io_threads > 1:
+        argv += ["--hicache-storage-io-threads", str(args.io_threads)]
     env["SGLANG_HICACHE_LAYERWISE_ROOT"] = str(Path(args.store_root) / "layerwise")
     env["SGLANG_HICACHE_LAYERWISE_MAX_SIZE"] = args.store_max_size
     env["SGLANG_HICACHE_LAYERWISE_MIN_FREE_SPACE"] = args.store_min_free

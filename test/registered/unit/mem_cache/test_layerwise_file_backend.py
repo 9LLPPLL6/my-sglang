@@ -433,6 +433,40 @@ class TestLayerwiseFileBackend(CustomTestCase):
         finally:
             fixture.close()
 
+    def test_close_reports_what_each_shard_actually_read(self):
+        """Without this line the streaming path's bandwidth is unobservable,
+        and its share of an exposed TTFT can only be inferred from the other
+        read path's numbers."""
+        fixture = _LayerwiseFixture(
+            page_size=16,
+            head_num=8,
+            head_dim=64,
+            dtype=torch.float16,
+            pages=4,
+            io_threads=2,
+        )
+        try:
+            keys = fixture.publish_pages()
+            _, handle, _ = fixture.stream(keys=keys, group_size=2)
+            state = fixture.backend._state(handle)
+
+            self.assertEqual(len(state.shard_of_page), len(keys))
+            self.assertGreater(state.bytes_done, 0)
+            self.assertGreater(state.extents_done, 0)
+            self.assertEqual(sum(state.shard_bytes.values()), state.bytes_done)
+            self.assertGreater(state.last_complete_s, state.first_submit_s)
+
+            with self.assertLogs(
+                "sglang.srt.mem_cache.layerwise_storage.file_backend", level="INFO"
+            ) as logs:
+                fixture.backend.close(handle=handle)
+            line = "\n".join(logs.output)
+            self.assertIn("layerwise_stream read:", line)
+            self.assertIn("threads=2", line)
+            self.assertIn("shard_bytes=", line)
+        finally:
+            fixture.close()
+
     def test_group_split_covers_every_layer_exactly_once(self):
         """Even groups, including the first; only the last may be short."""
         specs = split_layer_groups(layer_num=7, group_size=3)
