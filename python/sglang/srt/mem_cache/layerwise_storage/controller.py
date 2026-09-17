@@ -53,7 +53,6 @@ _READ_QUEUE_DEPTH = 512
 
 class LayerwiseControllerConfig(NamedTuple):
     root: str
-    first_group_layers: int
     group_size: int
     max_concurrent_streams: int
     group_timeout_s: float
@@ -128,7 +127,6 @@ class LayerwiseStorageController:
         """
         config = LayerwiseControllerConfig(
             root=backend.root,
-            first_group_layers=server_args.hicache_storage_first_group_layers,
             group_size=server_args.hicache_storage_group_size,
             max_concurrent_streams=(server_args.hicache_storage_max_concurrent_streams),
             group_timeout_s=server_args.hicache_storage_group_timeout_ms / 1000.0,
@@ -182,7 +180,6 @@ class LayerwiseStorageController:
             host_indices=host_indices,
             page_keys=page_keys,
             layout=self.layout,
-            first_group_layers=self.config.first_group_layers,
             group_size=self.config.group_size,
         )
         self._generation += 1

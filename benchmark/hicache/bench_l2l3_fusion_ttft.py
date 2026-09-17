@@ -348,8 +348,9 @@ def server_spec(server: str, args, port: int) -> tuple[list[str], dict]:
     if server == "l3_fused":
         argv += [
             "--hicache-storage-load-mode", "layerwise",
-            "--hicache-storage-first-group-layers", str(args.first_group_layers),
             "--hicache-storage-group-size", str(args.group_size),
+            "--hicache-storage-max-concurrent-streams",
+            str(args.max_concurrent_streams),
             "--hicache-storage-group-timeout-ms", str(args.group_timeout_ms),
         ]
     else:
@@ -958,7 +959,9 @@ def parse_args():
                         "storage call (0 = leave the 128 default). The controller "
                         "waits for each batch before starting the next, so this "
                         "caps how much a parallel backend can have in flight")
-    p.add_argument("--first-group-layers", type=int, default=1)
+    p.add_argument("--max-concurrent-streams", type=int, default=1,
+                   help="layerwise transactions allowed to stream at once; "
+                        "the rest fall back to the blocking whole-prefix read")
     p.add_argument("--group-size", type=int, default=8)
     p.add_argument("--group-timeout-ms", type=int, default=1000,
                    help="--hicache-storage-group-timeout-ms. A group that misses "

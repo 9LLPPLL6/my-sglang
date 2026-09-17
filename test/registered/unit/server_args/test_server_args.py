@@ -1553,7 +1553,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
         parsed = parser.parse_args(["--model-path", "dummy"])
 
         self.assertEqual(parsed.hicache_storage_load_mode, "full_wait")
-        self.assertEqual(parsed.hicache_storage_first_group_layers, 1)
         self.assertEqual(parsed.hicache_storage_group_size, 1)
         self.assertEqual(parsed.hicache_storage_group_timeout_ms, 1000)
         self.assertEqual(parsed.hicache_storage_admission_budget_ms, 0)
@@ -1568,8 +1567,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
                 "dummy",
                 "--hicache-storage-load-mode",
                 "layerwise",
-                "--hicache-storage-first-group-layers",
-                "1",
                 "--hicache-storage-group-size",
                 "4",
                 "--hicache-storage-group-timeout-ms",
@@ -1582,7 +1579,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
         )
 
         self.assertEqual(parsed.hicache_storage_load_mode, "layerwise")
-        self.assertEqual(parsed.hicache_storage_first_group_layers, 1)
         self.assertEqual(parsed.hicache_storage_group_size, 4)
         self.assertEqual(parsed.hicache_storage_group_timeout_ms, 2500)
         self.assertEqual(parsed.hicache_storage_admission_budget_ms, 25)
@@ -1591,7 +1587,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
     def test_full_wait_does_not_activate_layerwise_validation(self):
         args = self._make_args(
             hicache_storage_load_mode="full_wait",
-            hicache_storage_first_group_layers=0,
             hicache_storage_group_size=0,
             hicache_storage_group_timeout_ms=0,
             hicache_storage_admission_budget_ms=-1,
@@ -1603,7 +1598,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
     def test_valid_layerwise_config_and_disabled_admission_budget(self):
         args = self._make_args(
             **self._valid_layerwise_overrides(
-                hicache_storage_first_group_layers=1,
                 hicache_storage_group_size=4,
                 hicache_storage_group_timeout_ms=2500,
                 hicache_storage_admission_budget_ms=0,
@@ -1633,7 +1627,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
 
     def test_layerwise_numeric_bounds_fail_fast(self):
         cases = (
-            ("hicache_storage_first_group_layers", 0, "first-group-layers"),
             ("hicache_storage_group_size", 0, "group-size"),
             ("hicache_storage_group_timeout_ms", 0, "group-timeout-ms"),
             ("hicache_storage_admission_budget_ms", -1, "admission-budget-ms"),

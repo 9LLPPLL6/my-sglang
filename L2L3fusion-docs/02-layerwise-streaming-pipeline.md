@@ -223,7 +223,6 @@ python -m sglang.launch_server \
   --enable-hierarchical-cache \
   --hicache-storage-backend layerwise_file \
   --hicache-storage-load-mode layerwise \
-  --hicache-storage-first-group-layers 1 \
   --hicache-storage-group-size 8 \
   --hicache-io-backend direct \
   --hicache-mem-layout page_first_direct \
@@ -236,7 +235,10 @@ python -m sglang.launch_server \
 
 两个旋钮的含义：
 
-- `first-group-layers=1`：第 0 组只放 1 层。它是唯一藏不住的，越小越好。
+> 注：`first-group-layers` 已在分支 `L2-L3fusion-continuous-read` 上移除。
+> 第 0 组不再单独定尺寸，和其它组一样按 `group-size` 均分——实测（阶段 06）
+> 把它从 1 层改成 8 层，暴露时间只动了 1 ms，这个特例没有换来任何东西。
+
 - `group-size=8`：后续每组 8 层。太小则每个 I/O 请求太碎（阶段 01 测过：
   2 层只能拿到裸带宽的 53%，8 层能到 94%）。
 
@@ -246,7 +248,7 @@ python -m sglang.launch_server \
 启动日志里应该看到：
 
 ```
-Layerwise storage streaming enabled: first_group=1 layers, group=8 layers, read_ahead=2 groups
+Layerwise storage streaming enabled: group=8 layers, read_ahead=continuous
 ```
 
 如果看到 `Layerwise storage streaming disabled: unsupported ...`，

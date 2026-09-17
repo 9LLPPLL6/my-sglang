@@ -152,7 +152,7 @@ class _LayerwiseFixture:
             )
         return keys
 
-    def stream(self, *, keys, first_group_layers, group_size, timeout_s=20.0):
+    def stream(self, *, keys, group_size, timeout_s=20.0):
         """Run one transaction to completion, group by ordered group."""
         host_indices = torch.arange(len(keys) * self.host.page_size, dtype=torch.int64)
         plan, target = build_read_plan(
@@ -160,7 +160,6 @@ class _LayerwiseFixture:
             host_indices=host_indices,
             page_keys=keys,
             layout=self.layout,
-            first_group_layers=first_group_layers,
             group_size=group_size,
         )
         handle = self.backend.begin_read(
@@ -197,9 +196,7 @@ class TestLayerwiseFileBackend(CustomTestCase):
         )
         try:
             keys = fixture.publish_pages()
-            plan, handle, seen = fixture.stream(
-                keys=keys, first_group_layers=1, group_size=2
-            )
+            plan, handle, seen = fixture.stream(keys=keys, group_size=2)
 
             layer_stride = (
                 page_size
@@ -257,7 +254,6 @@ class TestLayerwiseFileBackend(CustomTestCase):
                 host_indices=host_indices,
                 page_keys=keys,
                 layout=fixture.layout,
-                first_group_layers=2,
                 group_size=2,
             )
             handle = fixture.backend.begin_read(
@@ -300,7 +296,6 @@ class TestLayerwiseFileBackend(CustomTestCase):
                 host_indices=host_indices,
                 page_keys=["never-written"],
                 layout=fixture.layout,
-                first_group_layers=1,
                 group_size=8,
             )
             handle = fixture.backend.begin_read(
@@ -339,7 +334,6 @@ class TestLayerwiseFileBackend(CustomTestCase):
                 host_indices=host_indices,
                 page_keys=keys,
                 layout=fixture.layout,
-                first_group_layers=1,
                 group_size=8,
             )
             handle = fixture.backend.begin_read(
@@ -363,10 +357,12 @@ class TestLayerwiseFileBackend(CustomTestCase):
             fixture.close()
 
     def test_group_split_covers_every_layer_exactly_once(self):
-        specs = split_layer_groups(layer_num=7, first_group_layers=1, group_size=3)
-        self.assertEqual(specs[0].layer_start, 0)
-        self.assertEqual(specs[0].layer_end, 1)
-        self.assertEqual(specs[-1].layer_end, 7)
+        """Even groups, including the first; only the last may be short."""
+        specs = split_layer_groups(layer_num=7, group_size=3)
+        self.assertEqual(
+            [(spec.layer_start, spec.layer_end) for spec in specs],
+            [(0, 3), (3, 6), (6, 7)],
+        )
         for previous, current in zip(specs, specs[1:]):
             self.assertEqual(previous.layer_end, current.layer_start)
 

@@ -2706,9 +2706,8 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.layerwise_bridge = LayerwiseRadixBridge(cache=self, controller=controller)
         logger.info(
-            "Layerwise storage streaming enabled: first_group=%d layers, "
-            "group=%d layers, read_ahead=continuous",
-            controller.config.first_group_layers,
+            "Layerwise storage streaming enabled: group=%d layers, "
+            "read_ahead=continuous",
             controller.config.group_size,
         )
 

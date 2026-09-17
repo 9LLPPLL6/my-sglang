@@ -51,7 +51,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--kv-heads", type=int, default=4, help="per-TP-rank KV heads")
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
-    parser.add_argument("--first-group-layers", type=int, default=1)
     parser.add_argument("--group-size", type=int, default=4)
     parser.add_argument("--queue-depth", type=int, default=128)
     parser.add_argument("--iters", type=int, default=5)
@@ -157,7 +156,6 @@ def _bench_layerwise(*, backend, host, keys, layout, args):
         host_indices=host_indices,
         page_keys=keys,
         layout=layout,
-        first_group_layers=args.first_group_layers,
         group_size=args.group_size,
     )
     total_nbytes = plan.total_io_nbytes
@@ -289,7 +287,7 @@ def main() -> None:
     print()
     print(
         f"groups            : {len(plan.groups)} "
-        f"(first {args.first_group_layers} layers, then {args.group_size})"
+        f"({args.group_size} layers per group)"
     )
     print(f"extents per group : {extents_per_group}")
     print(

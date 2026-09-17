@@ -39,20 +39,24 @@ class LayerGroupSpec(NamedTuple):
 def split_layer_groups(
     *,
     layer_num: int,
-    first_group_layers: int,
     group_size: int,
 ) -> tuple[LayerGroupSpec, ...]:
-    """Split ``[0, layer_num)`` into a small first group and steady groups."""
+    """Split ``[0, layer_num)`` into even ``group_size`` groups.
+
+    Group 0 is an ordinary group. It used to be sized separately, on the theory
+    that the one group no computation can hide should be as small as possible;
+    measured on GPFS its size moved the exposed time by 1 ms, so the special
+    case bought nothing and is gone.
+    """
     if layer_num <= 0:
         raise ValueError(f"layer_num must be positive, got {layer_num}")
-    if first_group_layers <= 0 or group_size <= 0:
-        raise ValueError("first_group_layers and group_size must be positive")
+    if group_size <= 0:
+        raise ValueError(f"group_size must be positive, got {group_size}")
 
     groups = []
     layer_start = 0
     while layer_start < layer_num:
-        span = first_group_layers if not groups else group_size
-        layer_end = min(layer_start + span, layer_num)
+        layer_end = min(layer_start + group_size, layer_num)
         groups.append(
             LayerGroupSpec(
                 group_id=len(groups), layer_start=layer_start, layer_end=layer_end
@@ -68,7 +72,6 @@ def build_read_plan(
     host_indices: torch.Tensor,
     page_keys: Sequence[str],
     layout: PageLayout,
-    first_group_layers: int,
     group_size: int,
 ) -> tuple[LayerwiseReadPlan, HostTargetBase]:
     """Plan every extent needed to stage ``page_keys`` into ``host_indices``."""
@@ -86,7 +89,6 @@ def build_read_plan(
 
     specs = split_layer_groups(
         layer_num=layout.identity.layer_num,
-        first_group_layers=first_group_layers,
         group_size=group_size,
     )
     target = HostTargetBase(

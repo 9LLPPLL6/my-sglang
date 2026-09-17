@@ -264,7 +264,6 @@ class TestLayerwiseHiCacheMemoryConfig(_IsolatedServerArgs):
 
         memory = get_memory()
         self.assertEqual(memory.hicache_storage_load_mode, "full_wait")
-        self.assertEqual(memory.hicache_storage_first_group_layers, 1)
         self.assertEqual(memory.hicache_storage_group_size, 1)
         self.assertEqual(memory.hicache_storage_group_timeout_ms, 1000)
         self.assertEqual(memory.hicache_storage_admission_budget_ms, 0)
@@ -276,7 +275,6 @@ class TestLayerwiseHiCacheMemoryConfig(_IsolatedServerArgs):
             enable_hierarchical_cache=True,
             hicache_storage_backend="layerwise_file",
             hicache_storage_load_mode="layerwise",
-            hicache_storage_first_group_layers=1,
             hicache_storage_group_size=4,
             hicache_storage_group_timeout_ms=2500,
             hicache_storage_admission_budget_ms=0,
@@ -287,7 +285,6 @@ class TestLayerwiseHiCacheMemoryConfig(_IsolatedServerArgs):
 
         memory = get_memory()
         self.assertEqual(memory.hicache_storage_load_mode, "layerwise")
-        self.assertEqual(memory.hicache_storage_first_group_layers, 1)
         self.assertEqual(memory.hicache_storage_group_size, 4)
         self.assertEqual(memory.hicache_storage_group_timeout_ms, 2500)
         self.assertEqual(memory.hicache_storage_admission_budget_ms, 0)

@@ -2875,12 +2875,6 @@ class ServerArgs:
         ),
         NS("memory"),
     ] = "full_wait"
-    hicache_storage_first_group_layers: A[
-        int,
-        "Number of layers in the admission-critical first storage group when "
-        "--hicache-storage-load-mode=layerwise.",
-        NS("memory"),
-    ] = 1
     hicache_storage_group_size: A[
         int,
         "Number of layers in each steady-state storage group when "
@@ -8262,10 +8256,6 @@ class ServerArgs:
             )
 
         positive_fields = (
-            (
-                "--hicache-storage-first-group-layers",
-                cfg.hicache_storage_first_group_layers,
-            ),
             ("--hicache-storage-group-size", cfg.hicache_storage_group_size),
             (
                 "--hicache-storage-max-concurrent-streams",

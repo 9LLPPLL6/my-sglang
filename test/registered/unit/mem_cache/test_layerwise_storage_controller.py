@@ -107,7 +107,7 @@ def _make_identity() -> PageIdentity:
 
 
 class _ControllerFixture:
-    def __init__(self, *, first_group_layers=1, group_size=2):
+    def __init__(self, *, group_size=2):
         self.root = tempfile.mkdtemp(prefix="sglang-layerwise-ctl-")
         probed = probe_alignment(self.root, require_direct=False)
         profile = AlignmentProfile(
@@ -138,7 +138,6 @@ class _ControllerFixture:
             cache_controller=self.cache_controller,
             config=LayerwiseControllerConfig(
                 root=self.root,
-                first_group_layers=first_group_layers,
                 group_size=group_size,
                 max_concurrent_streams=1,
                 group_timeout_s=30.0,
@@ -216,8 +215,8 @@ class TestLayerwiseStorageController(CustomTestCase):
 
             self.assertEqual(
                 fixture.cache_controller.ranges,
-                [(0, 1), (1, 3), (3, 5), (5, 7), (7, 8)],
-                "layer ranges must be contiguous and in order",
+                [(0, 2), (2, 4), (4, 6), (6, 8)],
+                "layer ranges must be contiguous, in order, and evenly split",
             )
             self.assertEqual(fixture.cache_controller.finished, 1)
             torch.testing.assert_close(
