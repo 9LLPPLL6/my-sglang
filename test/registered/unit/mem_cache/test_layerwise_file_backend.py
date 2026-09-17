@@ -102,7 +102,17 @@ def _reference_page(host: MHATokenToKVPoolHost, seed: int) -> torch.Tensor:
 class _LayerwiseFixture:
     """One temp-directory deployment: writer, backend and a matching host pool."""
 
-    def __init__(self, *, page_size, head_num, head_dim, dtype, layer_num=6, pages=3):
+    def __init__(
+        self,
+        *,
+        page_size,
+        head_num,
+        head_dim,
+        dtype,
+        layer_num=6,
+        pages=3,
+        io_threads=1,
+    ):
         self.root = tempfile.mkdtemp(prefix="sglang-layerwise-")
         probed = probe_alignment(self.root, require_direct=False)
         self.profile = AlignmentProfile(
@@ -132,6 +142,7 @@ class _LayerwiseFixture:
             root=self.root,
             identity=self.identity,
             queue_depth=64,
+            io_threads=io_threads,
             alignment_profile=self.profile,
             require_direct_io=False,
         )
@@ -353,6 +364,72 @@ class TestLayerwiseFileBackend(CustomTestCase):
                 if time.monotonic() > deadline:
                     raise TimeoutError("reads never reached a terminal state")
             fixture.backend.close(handle=handle)
+        finally:
+            fixture.close()
+
+    def test_sharded_reads_reproduce_the_kv_exactly(self):
+        """Several submitting threads must land the same bytes as one.
+
+        Each shard owns its own AIO context and reads a disjoint set of pages,
+        so a page landing in the wrong shard's target, or two shards racing one
+        file, shows up here as wrong KV rather than as a hang."""
+        fixture = _LayerwiseFixture(
+            page_size=16,
+            head_num=8,
+            head_dim=64,
+            dtype=torch.float16,
+            pages=5,
+            io_threads=4,
+        )
+        try:
+            keys = fixture.publish_pages()
+            fixture.host.kv_buffer.zero_()
+            _, handle, seen = fixture.stream(keys=keys, group_size=2)
+
+            for completions in seen.values():
+                for completion in completions:
+                    self.assertIs(completion.status, ExtentCompletionStatus.SUCCEEDED)
+            self.assertIs(
+                fixture.backend.poll_terminal(handle=handle),
+                HandleTerminalStatus.SUCCEEDED,
+            )
+            for page, reference in enumerate(fixture.references):
+                torch.testing.assert_close(
+                    fixture.host.kv_buffer[:, page], reference, rtol=0, atol=0
+                )
+            fixture.backend.close(handle=handle)
+        finally:
+            fixture.close()
+
+    def test_every_page_is_owned_by_exactly_one_shard(self):
+        """Two shards reading one page file would double-open it and could
+        interleave into the same target range."""
+        fixture = _LayerwiseFixture(
+            page_size=16,
+            head_num=8,
+            head_dim=64,
+            dtype=torch.float16,
+            pages=5,
+            io_threads=4,
+        )
+        try:
+            keys = fixture.publish_pages()
+            host_indices = torch.arange(
+                len(keys) * fixture.host.page_size, dtype=torch.int64
+            )
+            plan, target = build_read_plan(
+                host_pool=fixture.host,
+                host_indices=host_indices,
+                page_keys=keys,
+                layout=fixture.layout,
+                group_size=2,
+            )
+            handle = fixture.backend.begin_read(
+                transaction_id="txn-shard", generation=0, plan=plan, target=target
+            )
+            state = fixture.backend._state(handle)
+            self.assertEqual(set(state.shard_of_page), set(keys))
+            self.assertLessEqual(max(state.shard_of_page.values()), 3)
         finally:
             fixture.close()
 

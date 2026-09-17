@@ -2914,12 +2914,13 @@ class ServerArgs:
     hicache_storage_io_threads: A[
         int,
         "Number of worker threads the layerwise_file backend uses to submit "
-        "whole-prefix storage reads. 1 keeps the single-context submission "
+        "storage reads, on both the whole-prefix and the layerwise streaming "
+        "path. 1 keeps the single-context submission "
         "every other backend uses; a higher value gives each worker its own "
         "Linux AIO context and shards pages across them, so no page file is "
         "touched by two threads. A parallel filesystem needs this to reach its "
         "aggregate read bandwidth -- one submitting thread saturates well below "
-        "it. Applies to --hicache-storage-load-mode=full_wait only.",
+        "it.",
         NS("memory"),
     ] = 1
     hicache_storage_backend_extra_config: A[
@@ -8315,13 +8316,6 @@ class ServerArgs:
                 "--hicache-storage-backend=layerwise_file: it is that backend's "
                 "own Direct I/O submission path. Got "
                 f"{cfg.hicache_storage_backend!r}."
-            )
-        if cfg.hicache_storage_load_mode != "full_wait":
-            raise ValueError(
-                "--hicache-storage-io-threads > 1 requires "
-                "--hicache-storage-load-mode=full_wait: the layerwise streaming "
-                "pipeline submits through its own single-context controller and "
-                "would ignore the thread count."
             )
 
     def _validate_hicache_layerwise_compatibility(self):

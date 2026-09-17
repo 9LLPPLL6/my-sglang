@@ -1662,10 +1662,6 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
                 "layerwise_file",
             ),
             (
-                self._valid_layerwise_overrides(hicache_storage_io_threads=4),
-                "full_wait",
-            ),
-            (
                 {
                     "enable_hierarchical_cache": True,
                     "hicache_storage_backend": "layerwise_file",
@@ -1679,6 +1675,17 @@ class TestLayerwiseHiCacheArgs(CustomTestCase):
                 args = self._make_args(**overrides)
                 with self.assertRaisesRegex(ValueError, message):
                     args._handle_hicache()
+
+    def test_io_threads_is_accepted_on_the_layerwise_streaming_path(self):
+        """Sharded submission is what lifts the read off the single-submitter
+        ceiling, and the streaming path needs it as much as the whole-prefix
+        one; it used to be refused here."""
+        args = self._make_args(
+            **self._valid_layerwise_overrides(hicache_storage_io_threads=8)
+        )
+        args._handle_hicache()
+
+        self.assertEqual(resolution_result(args, "hicache_storage_io_threads"), 8)
 
     def test_io_threads_is_accepted_on_the_whole_prefix_read_path(self):
         args = self._make_args(

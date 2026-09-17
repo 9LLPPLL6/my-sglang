@@ -51,6 +51,10 @@ from sglang.srt.mem_cache.layerwise_storage.types import (
 
 logger = logging.getLogger(__name__)
 
+# How long a read shard sleeps when it has nothing to do. Submissions wake it,
+# so this only bounds how late an in-flight completion is noticed.
+_WORKER_IDLE_S = 0.0005
+
 _PRIORITY_LEVELS = (
     IoPriority.ADMISSION,
     IoPriority.DEMAND,
@@ -104,12 +108,44 @@ class _InflightExtent(NamedTuple):
     target_ptr: int
 
 
+class _Shard:
+    """One AIO context, its arbiter, and the single thread allowed to drive them.
+
+    A context owns a completion buffer and a dict of live iocbs, neither safe to
+    drive from two threads, so a shard is never shared. Sharding is what lifts
+    the read off the single-submitter ceiling: one thread batching into a deep
+    queue tops out far below what a parallel filesystem can serve, no matter how
+    deep the queue is.
+    """
+
+    def __init__(self, *, queue_depth: int):
+        self.context = LinuxAioContext(queue_depth=queue_depth)
+        self.arbiter = IoArbiter(context=self.context)
+        self.wake = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+
+
+def _split_positions(total: int, parts: int) -> list[range]:
+    """Contiguous, near-equal ranges; a page is never split across shards."""
+    if parts <= 1 or total <= 0:
+        return [range(total)]
+    base, extra = divmod(total, parts)
+    ranges = []
+    start = 0
+    for index in range(parts):
+        span = base + (1 if index < extra else 0)
+        ranges.append(range(start, start + span))
+        start += span
+    return ranges
+
+
 class _ReadHandleState:
     """Per-transaction bookkeeping owned by the backend."""
 
     def __init__(self, *, plan: LayerwiseReadPlan, target: HostTargetBase):
         self.plan = plan
         self.target = target
+        self.shard_of_page: dict[str, int] = {}
         self.submitted_groups: set[int] = set()
         self.pending_extents = 0
         self.completions: list[LayerwiseStorageCompletion] = []
@@ -125,6 +161,7 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
         root: str,
         identity: PageIdentity,
         queue_depth: int = 128,
+        io_threads: int = 1,
         fd_cache_capacity: int = 1024,
         alignment_profile: Optional[AlignmentProfile] = None,
         require_direct_io: bool = True,
@@ -140,8 +177,11 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
                 f"O_DIRECT is required but unavailable under {self.root!r}"
             )
 
-        self._context = LinuxAioContext(queue_depth=queue_depth)
-        self._arbiter = IoArbiter(context=self._context)
+        self._io_threads = max(1, io_threads)
+        self._shards = [
+            _Shard(queue_depth=queue_depth) for _ in range(self._io_threads)
+        ]
+        self._stop = threading.Event()
         self._files = DirectIOFileCache(capacity=fd_cache_capacity)
         self._bounce = BouncePool(alignment=self.alignment_profile.memory_alignment)
         self._capabilities = LayerwiseBackendCapabilities(
@@ -158,6 +198,24 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
         self._handles: dict[str, _ReadHandleState] = {}
         self._inflight: dict[int, _InflightExtent] = {}
         self._user_data = itertools.count(1)
+
+        # One shard keeps the old inline path exactly: the caller submits and
+        # drains on its own thread, and no worker exists to race it.
+        if self._io_threads > 1:
+            for index, shard in enumerate(self._shards):
+                shard.thread = threading.Thread(
+                    target=self._worker,
+                    args=(shard,),
+                    name=f"layerwise-l3-read-{index}",
+                    daemon=True,
+                )
+                shard.thread.start()
+        logger.info(
+            "LayerwiseFileBackend at %s: io_threads=%d queue_depth=%d",
+            self.root,
+            self._io_threads,
+            queue_depth,
+        )
 
     def capabilities(self) -> LayerwiseBackendCapabilities:
         return self._capabilities
@@ -176,10 +234,24 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
             validate_group_against_capabilities(
                 group=group, capabilities=self._capabilities
             )
+        state = _ReadHandleState(plan=plan, target=target)
+        # Assign every page to one shard up front, in plan order: a page file is
+        # then touched by one thread only, so its fd is not opened twice and two
+        # contexts never read the same file.
+        pages = list(
+            dict.fromkeys(
+                extent.storage_key for group in plan.groups for extent in group.extents
+            )
+        )
+        for shard_index, positions in enumerate(
+            _split_positions(len(pages), self._io_threads)
+        ):
+            for position in positions:
+                state.shard_of_page[pages[position]] = shard_index
         with self._lock:
             if transaction_id in self._handles:
                 raise RuntimeError(f"transaction {transaction_id!r} is already open")
-            self._handles[transaction_id] = _ReadHandleState(plan=plan, target=target)
+            self._handles[transaction_id] = state
         return LayerwiseReadHandle(
             transaction_id=transaction_id,
             generation=generation,
@@ -210,7 +282,7 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
                 extent=extent,
                 priority=io_priority,
             )
-        self._arbiter.pump()
+        self._wake_or_pump()
         return LayerwiseGroupTicket(
             handle=handle, group_id=group.group_id, backend_token=None
         )
@@ -221,7 +293,7 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
         handle: LayerwiseReadHandle,
         max_completions: Optional[int] = None,
     ) -> tuple[LayerwiseStorageCompletion, ...]:
-        self._drain()
+        self._drain_if_inline()
         state = self._state(handle)
         with self._lock:
             if max_completions is None:
@@ -248,7 +320,9 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
                 if extent.transaction_id == handle.transaction_id
                 and extent.group_id in wanted
             ]
-        removed = set(self._arbiter.cancel_queued(queued_ids))
+        removed = set()
+        for shard in self._shards:
+            removed.update(shard.arbiter.cancel_queued(queued_ids))
         for user_data in removed:
             self._retire_extent(user_data, status=ExtentCompletionStatus.CANCELLED)
 
@@ -273,7 +347,7 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
         return tuple(results)
 
     def poll_terminal(self, *, handle: LayerwiseReadHandle) -> HandleTerminalStatus:
-        self._drain()
+        self._drain_if_inline()
         state = self._state(handle)
         with self._lock:
             if state.pending_extents > 0:
@@ -297,7 +371,14 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
             del self._handles[handle.transaction_id]
 
     def shutdown(self) -> None:
-        self._context.close()
+        self._stop.set()
+        for shard in self._shards:
+            shard.wake.set()
+        for shard in self._shards:
+            if shard.thread is not None:
+                shard.thread.join(timeout=30)
+        for shard in self._shards:
+            shard.context.close()
         self._files.close()
 
     def page_path(self, page_key: str) -> str:
@@ -367,7 +448,8 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
         )
         with self._lock:
             self._inflight[user_data] = record
-        self._arbiter.enqueue(
+        shard = self._shards[state.shard_of_page.get(extent.storage_key, 0)]
+        shard.arbiter.enqueue(
             fd=fd,
             ptr=bounce.ptr if bounce is not None else target_ptr,
             nbytes=extent.io_nbytes,
@@ -376,8 +458,36 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
             priority=priority,
         )
 
-    def _drain(self) -> None:
-        for completion in self._arbiter.poll():
+    def _wake_or_pump(self) -> None:
+        """Hand the new work to the shard threads, or submit it here if alone."""
+        if self._io_threads == 1:
+            self._shards[0].arbiter.pump()
+            return
+        for shard in self._shards:
+            shard.wake.set()
+
+    def _drain_if_inline(self) -> None:
+        # With workers running, only they may touch a context; the caller reads
+        # what they have already recorded.
+        if self._io_threads == 1:
+            self._drain_shard(self._shards[0])
+
+    def _worker(self, shard: _Shard) -> None:
+        """Submit and drain one shard, and nothing else, for this shard's life."""
+        while not self._stop.is_set():
+            shard.wake.wait(_WORKER_IDLE_S)
+            shard.wake.clear()
+            try:
+                shard.arbiter.pump()
+                self._drain_shard(shard)
+            except Exception:
+                # A worker that dies here would strand its shard's extents with
+                # no completion ever recorded, and the pipeline would only see a
+                # group timeout with nothing to point at.
+                logger.exception("layerwise read shard failed")
+
+    def _drain_shard(self, shard: _Shard) -> None:
+        for completion in shard.arbiter.poll():
             if completion.failed:
                 self._retire_extent(
                     completion.user_data,

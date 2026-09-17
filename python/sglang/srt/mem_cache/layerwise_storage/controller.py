@@ -55,6 +55,7 @@ class LayerwiseControllerConfig(NamedTuple):
     root: str
     group_size: int
     max_concurrent_streams: int
+    io_threads: int
     group_timeout_s: float
     admission_budget_s: float
     slow_fallback: str
@@ -93,6 +94,7 @@ class LayerwiseStorageController:
             root=config.root,
             identity=identity,
             queue_depth=config.queue_depth,
+            io_threads=config.io_threads,
             alignment_profile=self.writer.alignment_profile,
         )
         self.pipeline = LayerwiseStoragePipeline(
@@ -129,6 +131,7 @@ class LayerwiseStorageController:
             root=backend.root,
             group_size=server_args.hicache_storage_group_size,
             max_concurrent_streams=(server_args.hicache_storage_max_concurrent_streams),
+            io_threads=server_args.hicache_storage_io_threads,
             group_timeout_s=server_args.hicache_storage_group_timeout_ms / 1000.0,
             admission_budget_s=(
                 server_args.hicache_storage_admission_budget_ms / 1000.0
@@ -140,6 +143,7 @@ class LayerwiseStorageController:
             root=backend.root,
             identity=identity,
             queue_depth=_READ_QUEUE_DEPTH,
+            io_threads=config.io_threads,
             alignment_profile=backend.alignment_profile,
             require_direct_io=backend.require_direct_io,
         )
