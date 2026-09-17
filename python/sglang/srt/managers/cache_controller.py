@@ -46,7 +46,7 @@ from sglang.srt.mem_cache.l2_transfer import (
     StreamingL2Transfer,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -147,10 +147,11 @@ class LayerLoadingEvent:
 
 
 class LayerDoneCounter:
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, max_concurrent_streams: int = 1):
         self.num_layers = num_layers
-        # extra producer and consumer counters for overlap mode
-        self.num_counters = 3
+        # One slot per concurrent storage stream, plus the two the non-streaming
+        # path has always had for overlap mode.
+        self.num_counters = max(1, max_concurrent_streams) + 2
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
@@ -158,17 +159,42 @@ class LayerDoneCounter:
         self.consumer_generation = -1
         # Set only while a storage-streaming load is open; see LayerLoadingEvent.wait.
         self.stream_pump = None
+        # Storage streams run in parallel and a batch carries one consumer
+        # index, which therefore cannot name all of them. ``wait_until`` gates
+        # on this set as well: producer slot -> the generation to wait for.
+        self.stream_consumers: dict[int, int] = {}
 
     def update_producer(self):
-        self.producer_index = (self.producer_index + 1) % self.num_counters
-        assert self.events[
-            self.producer_index
-        ].finish_event.query(), (
-            "Producer finish event should be ready before being reused."
+        # Take the next FREE slot rather than blindly the next one. With several
+        # streams open at once a rotation lands on a slot that is still in
+        # flight, and reusing it resets the generation another consumer is
+        # waiting on -- which an assert turns into a crash and `python -O` turns
+        # into a forward reading KV that never arrived.
+        for step in range(1, self.num_counters + 1):
+            index = (self.producer_index + step) % self.num_counters
+            if self.events[index].finish_event.query():
+                self.producer_index = index
+                self.producer_generation += 1
+                self.events[index].begin_generation(self.producer_generation)
+                return index
+        raise RuntimeError(
+            f"every one of the {self.num_counters} HiCache layer-gate slots is "
+            "still in flight; a load was started beyond what the gate can track"
         )
-        self.producer_generation += 1
-        self.events[self.producer_index].begin_generation(self.producer_generation)
-        return self.producer_index
+
+    def add_stream_consumer(self, index: int, generation: int) -> None:
+        """Gate every later ``wait_until`` on this storage stream too."""
+        if index < 0:
+            return
+        if index >= self.num_counters:
+            raise ValueError(
+                f"invalid HiCache stream consumer index {index}; "
+                f"expected [0, {self.num_counters})"
+            )
+        self.stream_consumers[index] = generation
+
+    def drop_stream_consumer(self, index: int) -> None:
+        self.stream_consumers.pop(index, None)
 
     def set_consumer(self, index: int, generation: Optional[int] = None):
         self.consumer_index = index
@@ -185,6 +211,18 @@ class LayerDoneCounter:
         )
 
     def wait_until(self, threshold: int, timeout: Optional[float] = None):
+        # Every open stream has to reach this layer, not just the one the batch
+        # happens to name: the batch's rows come from all of them, and a row
+        # whose stream is behind would otherwise be read before it arrived.
+        for index, generation in list(self.stream_consumers.items()):
+            if index == self.consumer_index:
+                continue  # waited below, at the generation the batch recorded
+            self.events[index].wait(
+                threshold,
+                generation=generation,
+                timeout=timeout,
+                pump=self.stream_pump,
+            )
         if self.consumer_index < 0:
             return
         self.events[self.consumer_index].wait(
@@ -199,6 +237,7 @@ class LayerDoneCounter:
         self.consumer_index = -1
         self.consumer_generation = -1
         self.stream_pump = None
+        self.stream_consumers.clear()
 
 
 class CacheOperation:
@@ -459,7 +498,10 @@ class HiCacheController:
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.layer_num)
+        self.layer_done_counter = LayerDoneCounter(
+            self.layer_num,
+            max_concurrent_streams=get_memory().hicache_storage_max_concurrent_streams,
+        )
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [

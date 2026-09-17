@@ -55,6 +55,7 @@ class LayerwiseControllerConfig(NamedTuple):
     root: str
     first_group_layers: int
     group_size: int
+    max_concurrent_streams: int
     group_timeout_s: float
     admission_budget_s: float
     slow_fallback: str
@@ -129,6 +130,7 @@ class LayerwiseStorageController:
             root=backend.root,
             first_group_layers=server_args.hicache_storage_first_group_layers,
             group_size=server_args.hicache_storage_group_size,
+            max_concurrent_streams=(server_args.hicache_storage_max_concurrent_streams),
             group_timeout_s=server_args.hicache_storage_group_timeout_ms / 1000.0,
             admission_budget_s=(
                 server_args.hicache_storage_admission_budget_ms / 1000.0

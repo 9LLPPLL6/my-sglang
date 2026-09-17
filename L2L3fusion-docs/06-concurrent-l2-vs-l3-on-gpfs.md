@@ -240,14 +240,46 @@ self._pending: dict[tuple[str, int], tuple] = {}
 
 **这块不用改。这本来是最危险的部分。**
 
-### 7.3 方案：把"等一个"改成"等所有在飞的流"
+### 7.3 先厘清：普通 load-back 不是第三条流
+
+| | 普通 load-back | 流式事务 |
+|---|---|---|
+| 触发于 | **L2 命中**——前缀已在 host | **L3 命中**——一个字节都还没到 host |
+| 要做的事 | host → GPU，一次 H2D | 存储 →（分组读）→ host →（分组 H2D）→ GPU |
+| 可能卡在哪 | 只有 PCIe 拷贝 | **存储读可能慢，数据可能还不存在** |
+| 入口 | `start_loading()` | `start_streaming_load()` |
+
+两者用的是**同一套层门**——开头都是 `update_producer()` 拿一个槽、然后按层
+`complete(layer_id)`。模型侧的 `wait_until(k)` 不关心数据从哪来。
+
+而现在同一个 batch 里**永远只有一个生产者**，靠的是合并：
+
+```python
+# start_streaming_load 里
+# A batch carries one consumer index, so an ordinary load-back queued by another
+# request in the same batch has to ride this session; a second producer would
+# leave that request's layers ungated. Its host data is already complete, so its
+# layers simply move with ours.
+if self.load_queue:
+    queued = CacheOperation.merge_ops(self.load_queue)
+    ...
+```
+
+**流式事务开启时，把排队的普通 load-back 吸收进自己的 session。**
+能这么干，正是因为普通 load-back 的数据已经完整，跟着流式的节奏走最多慢一点，
+不会读到空数据。批次选哪个 index 也是二选一（`ready_to_load_host_cache`）：
+有流式就用流式的，没有就让普通的自己开一个。
+
+所以普通 load-back 是**最简单的那部分**：数据已完整，挂到哪条流上都安全，
+也不会因为存储抖动把别人拖住。
+
+### 7.4 方案：把"等一个"改成"等所有在飞的流"
 
 ```
 forward 算到第 k 层
   └─ wait_until(k)
-       ├─ 等流 A 到第 k 层
-       ├─ 等流 B 到第 k 层      ← 新增
-       └─ 等普通 load-back 到第 k 层
+       ├─ 等流 A 到第 k 层（可能捎带了一批普通 load-back）
+       └─ 等流 B 到第 k 层      ← 新增
 ```
 
 batch 按最慢的那条流推进。听起来像退步，但对比现状——现在第二个请求
@@ -264,7 +296,7 @@ batch 按最慢的那条流推进。听起来像退步，但对比现状——�
 **建议让 counter 内部维护"流式消费者集合"、batch 那个 index 只管普通 load-back**，
 这样不用碰 `ScheduleBatch` 的字段。
 
-### 7.4 最容易踩的坑
+### 7.5 最容易踩的坑：生产者环会绕回到还在飞的槽位
 
 ```python
 def update_producer(self):
@@ -273,13 +305,37 @@ def update_producer(self):
         "Producer finish event should be ready before being reused."
 ```
 
-生产者环按 `% num_counters` 轮转。并发流式下，第 N+1 个流会绕回到一个
-**还在飞**的槽位 → **断言失败，进程挂掉**。
+层门只有**固定 3 个格子**，每次新加载**按顺序占下一个**（0→1→2→0→…），
+不挑空位。那句断言的意思是"我要占这个格子了，上一个用它的人应该已经走了吧"。
 
-所以第 2 项不是"调大一点就行"：**必须有一个硬性的并发流上限，
-且 `busy()` 要按这个上限拒绝**，不能让 producer 环绕回来。
+今天成立，因为同时最多一个流式加载；等转一圈回来，原来那位早搬完了。
+并发流式之后：
 
-### 7.5 分两步
+```
+流 A 开始 → 占格子 0   （A 正在读 GPFS，要 400 ms）
+流 B 开始 → 占格子 1
+流 C 开始 → 占格子 2
+流 D 开始 → 轮到格子 0 → ★ A 还在读 → 断言失败，进程挂掉
+```
+
+**"把格子调大"不够**——只要没有东西限制同时能开几个流，流量一大照样绕回来。
+必须两件事一起做：
+
+1. 格子数扩到 `最大并发流 + 2`（留余量给普通 load-back 和 overlap 调度）
+2. **`busy()` 按这个上限拒绝第 N+1 个流**，让它退回阻塞读，而不是去抢格子
+
+第 2 条才是真正的保护；第 1 条只是给它留够空间。
+
+**为什么这是最容易踩的坑**：单元测试里流很短，转一圈早就空了，测不出来；
+只有真实负载 + 存储慢 + 并发高才撞上。而且——**Python 用 `-O` 跑会把 `assert`
+整个去掉**，那时占用一个还在飞的格子不会崩，而是把别人的进度计数器清零重用：
+正在等第 20 层的请求会被告知"已完成"，于是去读**根本还没搬到的 KV**。
+**从崩溃变成静默输出错误结果**，比挂掉难查一百倍。
+
+所以除了上限之外，`update_producer` 本身也应该**跳过被占用的槽位、
+找不到就显式报错**，而不是盲目轮转后靠断言兜底。
+
+### 7.6 分两步
 
 - **第一步**：并发流上限从 1 提到 N（比如 4），结构照旧，batch 按最慢的流走。
   预计 4 个文件、200 行量级 + 单元测试。

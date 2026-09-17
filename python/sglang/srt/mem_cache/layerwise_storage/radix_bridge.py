@@ -105,11 +105,13 @@ class LayerwiseRadixBridge:
         self._cache = cache
         self.controller = controller
         self._staged: dict[str, _Staged] = {}
-        # At most one transaction may be streaming at a time in V1: a second
-        # would need its own producer slot in the layer gate, and the batch
-        # carries only one consumer index.
-        self._streaming_req_id: Optional[str] = None
-        self._streaming_producer_index = -1
+        # Each streaming transaction owns a producer slot in the layer gate.
+        # A batch still carries one consumer index, so the gate tracks the rest
+        # as stream consumers (LayerDoneCounter.add_stream_consumer) and waits
+        # on all of them. The cap is what keeps a slot from being reused while
+        # it is still in flight.
+        self._streaming: dict[str, int] = {}
+        self._max_streams = max(1, controller.config.max_concurrent_streams)
         # Device prefix matched when the fetch was enqueued; needed to rebuild
         # the full-span tree key at admission.
         self._prefix_ctx: dict[str, list[int]] = {}
@@ -122,7 +124,8 @@ class LayerwiseRadixBridge:
         return req_id in self._staged
 
     def busy(self) -> bool:
-        return self._streaming_req_id is not None
+        """True when no more transactions may be taken over right now."""
+        return len(self._staged) >= self._max_streams
 
     def set_prefix_ctx(self, req_id: str, matched_prefix_tokens) -> None:
         self._prefix_ctx[req_id] = list(matched_prefix_tokens or [])
@@ -140,8 +143,8 @@ class LayerwiseRadixBridge:
             return False
         if matched_prefix_tokens is None:
             return False
-        if self.busy() or self._staged:
-            # One streaming transaction at a time; the rest use the old path.
+        if self.busy():
+            # At capacity; the rest use the old blocking path.
             return False
 
         page_keys = list(operation.hash_value)
@@ -285,9 +288,14 @@ class LayerwiseRadixBridge:
             device_indices=device_indices,
             node_ids=[load_back_id],
         )
-        self._streaming_req_id = staged.req_id
-        self._streaming_producer_index = self.controller.consumer_index(staged.req_id)
-        cache.cache_controller.layer_done_counter.stream_pump = self._pump
+        counter = cache.cache_controller.layer_done_counter
+        producer_index = self.controller.consumer_index(staged.req_id)
+        self._streaming[staged.req_id] = producer_index
+        if producer_index >= 0:
+            counter.add_stream_consumer(
+                producer_index, counter.events[producer_index].generation
+            )
+        counter.stream_pump = self._pump
         staged.admitted = True
 
         cache.insert(
@@ -314,8 +322,16 @@ class LayerwiseRadixBridge:
         )
 
     def streaming_consumer_index(self) -> int:
-        """Producer slot the admitting batch must gate on, or -1."""
-        return self._streaming_producer_index
+        """Producer slot the admitting batch must gate on, or -1.
+
+        The batch carries one index, so any open stream will do: every other
+        one is gated through the counter's stream-consumer set. Which one the
+        batch names only decides where a queued ordinary load-back rides.
+        """
+        for producer_index in self._streaming.values():
+            if producer_index >= 0:
+                return producer_index
+        return -1
 
     def try_finish_load_back(self, ack_id: int) -> bool:
         """Claim the streaming ack and release the private staging."""
@@ -340,20 +356,25 @@ class LayerwiseRadixBridge:
         self._discard(staged, reason="request aborted")
 
     def _pump(self) -> None:
-        """Advance the streaming transaction from inside the model's layer wait."""
-        req_id = self._streaming_req_id
-        if req_id is None:
-            return
-        staged = self._staged.get(req_id)
-        if staged is None:
+        """Advance every streaming transaction from inside the model's layer wait.
+
+        One poll drives them all -- the controller already walks its active
+        set -- but each is checked for an abort separately. Any abort raises:
+        the gate is blocking the forward, and a silent return would hang it.
+        Raising takes down the whole forward, including requests whose own
+        stream is healthy; per-request poison/replay is not implemented (see
+        the module README).
+        """
+        if not self._streaming:
             return
         self.controller.poll()
-        if staged.transaction.aborted:
-            # The gate is blocking the forward; a silent return would hang it.
-            raise LayerwiseStreamError(
-                f"layerwise storage read failed mid-forward for req={req_id}: "
-                f"{staged.transaction.error}"
-            )
+        for req_id in list(self._streaming):
+            staged = self._staged.get(req_id)
+            if staged is not None and staged.transaction.aborted:
+                raise LayerwiseStreamError(
+                    f"layerwise storage read failed mid-forward for req={req_id}: "
+                    f"{staged.transaction.error}"
+                )
 
     def _alloc_device(self, num_tokens: int) -> Optional[torch.Tensor]:
         """Evict before allocating, the way an ordinary load-back does."""
@@ -407,10 +428,12 @@ class LayerwiseRadixBridge:
         )
         self._staged.pop(staged.req_id, None)
         self._prefix_ctx.pop(staged.req_id, None)
-        if self._streaming_req_id == staged.req_id:
-            self._streaming_req_id = None
-            self._streaming_producer_index = -1
-            cache.cache_controller.layer_done_counter.stream_pump = None
+        producer_index = self._streaming.pop(staged.req_id, None)
+        counter = cache.cache_controller.layer_done_counter
+        if producer_index is not None and producer_index >= 0:
+            counter.drop_stream_consumer(producer_index)
+        if not self._streaming:
+            counter.stream_pump = None
 
     def _publish_host(self, staged: _Staged) -> None:
         """Make the completed staging an ordinary L2 entry.

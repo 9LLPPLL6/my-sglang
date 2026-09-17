@@ -2887,6 +2887,13 @@ class ServerArgs:
         "--hicache-storage-load-mode=layerwise.",
         NS("memory"),
     ] = 1
+    hicache_storage_max_concurrent_streams: A[
+        int,
+        "Maximum number of layerwise storage transactions that may stream at "
+        "once. Requests beyond this fall back to the blocking whole-prefix "
+        "read, which is what every request did before this was raised above 1.",
+        NS("memory"),
+    ] = 1
     hicache_storage_group_timeout_ms: A[
         int,
         "Hard timeout in milliseconds for one layerwise storage group.",
@@ -8260,6 +8267,10 @@ class ServerArgs:
                 cfg.hicache_storage_first_group_layers,
             ),
             ("--hicache-storage-group-size", cfg.hicache_storage_group_size),
+            (
+                "--hicache-storage-max-concurrent-streams",
+                cfg.hicache_storage_max_concurrent_streams,
+            ),
             (
                 "--hicache-storage-group-timeout-ms",
                 cfg.hicache_storage_group_timeout_ms,

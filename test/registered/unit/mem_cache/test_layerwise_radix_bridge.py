@@ -32,8 +32,16 @@ class _FakeTransaction:
         self.error = None
 
 
+class _FakeControllerConfig:
+    """Only what the bridge reads off the real LayerwiseControllerConfig."""
+
+    def __init__(self, max_concurrent_streams=1):
+        self.max_concurrent_streams = max_concurrent_streams
+
+
 class _FakeController:
-    def __init__(self):
+    def __init__(self, max_concurrent_streams=1):
+        self.config = _FakeControllerConfig(max_concurrent_streams)
         self.transaction = _FakeTransaction()
         self.aborted_with = None
         self.released = []
@@ -62,8 +70,23 @@ class _FakeController:
         self.forward_complete.append(req_id)
 
 
+class _FakeLayerGate:
+    """Only the surface the bridge touches on LayerDoneCounter."""
+
+    def __init__(self):
+        self.stream_pump = "stale-callback-from-a-previous-batch"
+        self.stream_consumers = {}
+        self.events = [SimpleNamespace(generation=7) for _ in range(8)]
+
+    def add_stream_consumer(self, index, generation):
+        self.stream_consumers[index] = generation
+
+    def drop_stream_consumer(self, index):
+        self.stream_consumers.pop(index, None)
+
+
 def _fake_cache():
-    counter = SimpleNamespace(stream_pump="stale-callback-from-a-previous-batch")
+    counter = _FakeLayerGate()
     cache_controller = SimpleNamespace(
         layer_done_counter=counter,
         append_host_mem_release=mock.Mock(),
@@ -138,8 +161,7 @@ class TestLayerwiseRadixBridge(CustomTestCase):
         self.controller.transaction.admission_ready = True
         staged = self.bridge._staged[req_id]
         staged.admitted = True
-        self.bridge._streaming_req_id = req_id
-        self.bridge._streaming_producer_index = 2
+        self.bridge._streaming[req_id] = 2
         self.cache.cache_controller.layer_done_counter.stream_pump = self.bridge._pump
         self.assertEqual(self.bridge.streaming_consumer_index(), 2)
 
@@ -151,11 +173,65 @@ class TestLayerwiseRadixBridge(CustomTestCase):
         self.assertEqual(self.controller.forward_complete, [req_id])
         self.cache.tree_core.insert_host.assert_called_once()
 
+    def test_a_second_transaction_streams_when_capacity_allows(self):
+        """Above a cap of one, a second storage hit is taken over rather than
+        pushed down the blocking path."""
+        bridge = LayerwiseRadixBridge(
+            cache=_fake_cache(), controller=_FakeController(max_concurrent_streams=2)
+        )
+        cache, controller = bridge._cache, bridge.controller
+
+        _stage(bridge, cache, controller, req_id="req-a")
+        self.assertFalse(bridge.busy())
+        _stage(bridge, cache, controller, req_id="req-b")
+
+        self.assertEqual(set(bridge._staged), {"req-a", "req-b"})
+        self.assertTrue(bridge.busy(), "two staged is the cap")
+
+    def test_capacity_sends_the_overflow_down_the_blocking_path(self):
+        """At the cap `start` declines instead of queueing or raising: the
+        caller's next line is the ordinary whole-prefix read."""
+        _stage(self.bridge, self.cache, self.controller, req_id="req-a")
+        self.assertTrue(self.bridge.busy())
+
+        overflow = SimpleNamespace(
+            request_id="req-b",
+            host_indices=torch.arange(_PAGES * _PAGE_SIZE, dtype=torch.int64),
+            hash_value=[f"page{index}" for index in range(_PAGES)],
+            id=12,
+        )
+        self.cache.ongoing_prefetch["req-b"] = SimpleNamespace(
+            prefetch_key=mock.MagicMock(), anchor_node_id=7, anchor_lock_params=None
+        )
+        self.bridge.set_prefix_ctx("req-b", [1, 2, 3])
+
+        self.assertFalse(self.bridge.start(overflow))
+        self.assertNotIn("req-b", self.bridge._staged)
+
+    def test_one_stream_finishing_leaves_the_others_gated(self):
+        """The pump is shared, so it may only be cleared once the last stream
+        is done; dropping it early would unhook a forward still waiting."""
+        gate = self.cache.cache_controller.layer_done_counter
+        req_id, _ = _stage(self.bridge, self.cache, self.controller)
+        staged = self.bridge._staged[req_id]
+        staged.admitted = True
+        self.bridge._streaming[req_id] = 2
+        self.bridge._streaming["req-other"] = 3
+        gate.add_stream_consumer(2, 7)
+        gate.add_stream_consumer(3, 7)
+        gate.stream_pump = self.bridge._pump
+
+        self.assertTrue(self.bridge.try_finish_load_back(-(staged.operation_id) - 1))
+
+        self.assertEqual(set(gate.stream_consumers), {3}, "only slot 2 is released")
+        self.assertIsNotNone(gate.stream_pump, "req-other is still streaming")
+        self.assertEqual(self.bridge.streaming_consumer_index(), 3)
+
     def test_staging_a_backend_still_holds_is_quarantined_not_freed(self):
         req_id, _ = _stage(self.bridge, self.cache, self.controller)
         staged = self.bridge._staged[req_id]
         staged.admitted = True
-        self.bridge._streaming_req_id = req_id
+        self.bridge._streaming[req_id] = 0
         self.controller.release_ok = False
 
         self.assertTrue(self.bridge.try_finish_load_back(-(staged.operation_id) - 1))

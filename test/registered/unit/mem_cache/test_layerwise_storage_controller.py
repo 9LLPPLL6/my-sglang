@@ -140,6 +140,7 @@ class _ControllerFixture:
                 root=self.root,
                 first_group_layers=first_group_layers,
                 group_size=group_size,
+                max_concurrent_streams=1,
                 group_timeout_s=30.0,
                 admission_budget_s=0.0,
                 slow_fallback="full_wait",
