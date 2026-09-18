@@ -244,8 +244,10 @@ forward 被层门完全卡住，10 组串行，读多久暴露多久。
 
 1. **绝对 TTFT 仍偏高（2.7 秒）**：服务端沿用单请求 bench 的配置
    （`--chunked-prefill-size -1`、triton backend、无 CUDA graph）。两臂同配，相对比较可信。
-2. **GPFS pagepool 无法证伪**（阶段 03 §6）；本阶段 `--churn-gib` 用默认 0。
-   读盘满额 + 埋点里的真实 ms 数说明读确实发生了。
+2. ~~**GPFS pagepool 无法证伪**（阶段 03 §6）；本阶段 `--churn-gib` 用默认 0。~~
+   **阶段 08 后续已实测**：本节点 pagepool 为 32 GiB，`--churn-gib 40` 把它完整挤掉
+   之后，带宽 50.4 → 51.0 GiB/s、读 span 24.8 → 24.5 ms，**无可测差异**。
+   这正是 O_DIRECT 真正绕过 pagepool 时该有的结果。
 3. **`io_threads=8` 在 page 512 下不一定是最优**，阶段 04 §6 说真机只扫过 1 和 16 两个点，
    harness 里最优落在 4–8。本阶段未扫。
 4. **背景负载是"短输入 + 长生成"**，不是"不断到达的新请求"。后者会 churn 缓存更厉害、

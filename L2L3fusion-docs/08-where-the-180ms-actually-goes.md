@@ -420,6 +420,37 @@ wait_complete`（为了让读取时间可归因）。换成 `best_effort`，请�
 结果阻塞，这 130 ms 就不存在。**`best_effort` 下的行为未测**，所以这一条在生产上
 值多少，尚不能下结论。
 
+### 附：GPFS pagepool 这条局限已经排除
+
+本系列一直挂着一条无法证伪的局限——GPFS 用自己的 pagepool 缓存文件数据，
+`mincore` 恒返回 0、`fadvise` 是空操作，所以既看不见也清不掉，无法声称一次读是冷的。
+
+这台机器的实际配置：
+
+```
+pagepool      32 GiB      （mmfsd 在本地 RAM 里 pin 住的缓存）
+maxblocksize  16M
+本机内存       724 GiB
+```
+
+每轮 L3 臂读 20 GiB < 32 GiB，理论上整个测试集都可能驻留在 pagepool 里。
+用 `--churn-gib 40`（> 32 GiB）在计时读之前把它完整挤掉，对照：
+
+| | 每卡带宽 | 读 span | 读盘 |
+|---|---|---|---|
+| churn 0 | 50.4 GiB/s | 24.8 ms | 20.00 GiB |
+| **churn 40 GiB** | **51.0 GiB/s** | **24.5 ms** | 20.00 GiB |
+
+**无可测差异。** churn 本身确实执行了（读 40 GiB 耗时 3626 ms，约 11 GiB/s 单线程
+缓冲读），所以不是"没挤动"。这正是 O_DIRECT 真正绕过 pagepool 时该有的样子——
+pagepool 不在读路径上，清不清都一样。
+
+佐证：缓冲读只有 11 GiB/s，而 O_DIRECT 8 线程是每卡 50 GiB/s。若 O_DIRECT 实际
+走 pagepool，不该比缓冲路径快 5 倍。
+
+**边界**：这只排除了"本地 32 GiB pagepool 供数"。GPFS 服务端（NSD server）自身的
+缓存不在本实验射程内，仍未证伪。
+
 ### 仍未解决
 
 准入晚一趟这件事没有修。候选修法是**在入队时预分配 host 内存**——入队本来就在
