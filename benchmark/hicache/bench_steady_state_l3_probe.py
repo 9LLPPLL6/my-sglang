@@ -173,7 +173,15 @@ class Background:
 def check_tiers(arm, probes, hit_tokens):
     """The background load evicting a probe prefix out of L2 is the failure this
     run is most exposed to, and it is silent: the probe simply reads from a
-    lower tier. Say so loudly instead of reporting its TTFT as an L2 number."""
+    lower tier. Say so loudly instead of reporting its TTFT as an L2 number.
+
+    These read the per-tier breakdown, which is only as good as the engine's
+    own accounting of it -- the streaming path used to report an L3 hit as a
+    host hit, which made the L2 arm's check here unfirable. The independent
+    check is `disk_read_bytes`, recorded per arm: it is 0 for a genuine L2 arm
+    and the full KV size for an L3 one, and it cannot be fooled by a
+    mis-labelled tier.
+    """
     complaints = []
     for index, probe in enumerate(probes):
         tier = probe["tier"]
@@ -188,10 +196,14 @@ def check_tiers(arm, probes, hit_tokens):
         else:
             if tier["device"] > 0:
                 complaints.append(f"probe {index}: device={tier['device']} -- HBM leak")
-            if tier["host"] + tier["storage"] < hit_tokens:
+            if tier["host"] > 0:
                 complaints.append(
-                    f"probe {index}: hit {tier['host'] + tier['storage']} "
-                    f"< {hit_tokens}"
+                    f"probe {index}: host={tier['host']} -- the prefix was still "
+                    "in host memory, so this is not an L3 measurement"
+                )
+            if tier["storage"] < hit_tokens:
+                complaints.append(
+                    f"probe {index}: storage={tier['storage']} < {hit_tokens}"
                 )
     return complaints
 

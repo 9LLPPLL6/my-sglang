@@ -156,6 +156,47 @@ class TestLayerwiseRadixBridge(CustomTestCase):
         self.assertTrue(self.bridge.check_progress(req_id))
         self.assertEqual(release.call_count, 1)
 
+    def test_admission_records_what_came_from_storage(self):
+        """An L3 hit has to read back as an L3 hit.
+
+        Taking over the operation means the whole-prefix path's completion
+        handler never runs, so nothing else records the count. The scheduler
+        pops it at admission and feeds it to the tier split; left at zero, the
+        split charges every one of these tokens to L2 -- because the staged
+        tokens are correctly surfaced as host_hit_length, and storage is
+        subtracted out of that.
+        """
+        req_id, num_tokens = _stage(self.bridge, self.cache, self.controller)
+        self.assertNotIn(req_id, self.cache.prefetch_loaded_tokens_by_reqid)
+
+        self.controller.transaction.admission_ready = True
+        self.assertTrue(self.bridge.check_progress(req_id))
+
+        self.assertEqual(
+            self.cache.prefetch_loaded_tokens_by_reqid[req_id], num_tokens
+        )
+
+    def test_a_dropped_transaction_records_no_storage_tokens(self):
+        req_id, _ = _stage(self.bridge, self.cache, self.controller)
+        self.controller.transaction.aborted = True
+
+        self.assertTrue(self.bridge.check_progress(req_id))
+
+        self.assertEqual(self.cache.prefetch_loaded_tokens_by_reqid[req_id], 0)
+
+    def test_finishing_a_stream_leaves_no_count_behind(self):
+        """The count is consumed at admission; a second write would never be
+        popped, and the dict is keyed by request id."""
+        req_id, _ = _stage(self.bridge, self.cache, self.controller)
+        self.controller.transaction.admission_ready = True
+        self.bridge.check_progress(req_id)
+        staged = self.bridge._staged[req_id]
+        staged.admitted = True
+
+        self.assertTrue(self.bridge.try_finish_load_back(-(staged.operation_id) - 1))
+
+        self.assertNotIn(req_id, self.cache.prefetch_loaded_tokens_by_reqid)
+
     def test_finishing_a_stream_clears_the_shared_layer_gate_pump(self):
         req_id, _ = _stage(self.bridge, self.cache, self.controller)
         self.controller.transaction.admission_ready = True

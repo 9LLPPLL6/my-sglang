@@ -211,6 +211,16 @@ class LayerwiseRadixBridge:
                 reason=transaction.error or "a rank could not read the first group",
             )
             return True
+        # Record what came from storage, the way the whole-prefix path records
+        # it in `_handle_prefetch_result`. Taking over the operation means that
+        # handler never runs for this request, and without this the scheduler
+        # pops a zero: the hit is then reported entirely as an L2 hit, because
+        # the staged tokens are (correctly) surfaced as host_hit_length and the
+        # tier split subtracts storage out of it. An L3 hit that reads itself
+        # back as an L2 hit is wrong in the metrics and, worse, silently
+        # disarms the benchmark assertion that watches for a probe prefix
+        # falling out of L2.
+        self._cache.prefetch_loaded_tokens_by_reqid[req_id] = staged.num_tokens
         return True
 
     def _agree(self, *, decided: bool, usable: bool) -> tuple[bool, bool]:
@@ -423,9 +433,13 @@ class LayerwiseRadixBridge:
             cache.dec_host_lock_ref(staged.anchor_node_id, staged.anchor_lock_params)
         cache.ongoing_prefetch.pop(staged.req_id, None)
         cache.cache_controller.prefetch_tokens_occupied -= staged.num_tokens
-        cache.prefetch_loaded_tokens_by_reqid[staged.req_id] = (
-            staged.num_tokens if insert_host else 0
-        )
+        if insert_host:
+            # The count was recorded at admission, which is the only moment the
+            # scheduler reads it. Writing it again here lands after that pop and
+            # would leave an entry nobody ever removes.
+            cache.prefetch_loaded_tokens_by_reqid.pop(staged.req_id, None)
+        else:
+            cache.prefetch_loaded_tokens_by_reqid[staged.req_id] = 0
         self._staged.pop(staged.req_id, None)
         self._prefix_ctx.pop(staged.req_id, None)
         producer_index = self._streaming.pop(staged.req_id, None)
