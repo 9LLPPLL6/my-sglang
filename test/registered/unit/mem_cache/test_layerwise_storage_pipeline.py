@@ -210,22 +210,6 @@ class _PipelineFixture:
 
 
 class TestLayerwiseStoragePipeline(CustomTestCase):
-    def test_only_group_zero_is_submitted_before_it_lands(self):
-        fixture = _PipelineFixture()
-
-        self.assertEqual(fixture.backend.submitted, [0])
-        self.assertEqual(fixture.backend.submitted_priorities[0], 0)
-
-        fixture.pipeline.advance(fixture.transaction)
-        self.assertEqual(
-            fixture.backend.submitted, [0], "read-ahead must wait for group 0"
-        )
-
-        fixture.backend.complete_group(0)
-        fixture.pipeline.advance(fixture.transaction)
-        self.assertEqual(fixture.backend.submitted[:3], [0, 1, 2])
-        self.assertGreater(fixture.backend.submitted_priorities[1], 0)
-
     def test_admission_waits_for_cross_rank_agreement_on_group_zero(self):
         consensus = _DeferredConsensus()
         fixture = _PipelineFixture(consensus=consensus)
@@ -242,28 +226,38 @@ class TestLayerwiseStoragePipeline(CustomTestCase):
             fixture.transaction.machine.state, TransactionState.ADMISSION_READY
         )
 
-    def test_read_ahead_is_continuous_once_group0_is_in_hand(self):
-        """Every remaining group goes out at once; retirement gates nothing.
+    def test_the_whole_plan_is_submitted_before_any_group_completes(self):
+        """The reader never waits on the scheduler thread to be given more work.
 
-        The arbiter is the only backpressure now, so the pipeline hands it the
-        whole plan rather than metering submissions against a window.
+        Holding the rest back until group 0 lands leaves the device idle for
+        however long it takes the scheduler thread to come back and look --
+        one full iteration, measured at ~132 ms of a 171 ms read on GPFS.
+        Ordering is the arbiter's job: group 0 is queued at admission priority
+        and the arbiter reserves slots for it.
         """
         fixture = _PipelineFixture(group_count=6)
 
         self.assertEqual(
             sorted(fixture.backend.submitted),
-            [0],
-            "group 0 is submitted alone because it gates admission",
+            [0, 1, 2, 3, 4, 5],
+            "the whole plan is handed to the arbiter up front",
+        )
+        priorities = fixture.backend.submitted_priorities
+        self.assertEqual(
+            priorities[0],
+            min(priorities.values()),
+            "group 0 still outranks the rest -- it is what admission waits on",
+        )
+        self.assertEqual(
+            len(set(priorities[g] for g in range(1, 6))),
+            1,
+            "and the rest share one read-ahead priority",
         )
 
+        # Advancing submits nothing further; it only observes.
         fixture.backend.complete_group(0)
         fixture.pipeline.advance(fixture.transaction)
-        self.assertEqual(
-            sorted(fixture.backend.submitted),
-            [0, 1, 2, 3, 4, 5],
-            "the rest of the plan follows group 0 without waiting for any "
-            "group to retire",
-        )
+        self.assertEqual(sorted(fixture.backend.submitted), [0, 1, 2, 3, 4, 5])
 
         fixture.admit()
         for group_id in range(1, 6):

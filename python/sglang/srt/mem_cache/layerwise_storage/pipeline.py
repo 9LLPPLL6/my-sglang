@@ -83,6 +83,17 @@ class LayerwiseTransaction:
         self.next_consensus_group_id = 0
         self.next_h2d_group_id = 0
         self.group_deadlines: dict[int, float] = {}
+        # Wall clock of the few state changes that decide when the request is
+        # admitted. The design admits on group 0, but measured admission lands
+        # with the whole read instead, and that gap cannot be read off the
+        # backend's own report: it is a question about when the scheduler
+        # thread got around to looking, not about the I/O. Same clock as the
+        # per-request time stats, so the two logs subtract.
+        self.marks: dict[str, float] = {}
+
+    def mark(self, event: str) -> None:
+        """First occurrence wins; a later group must not overwrite group 0's."""
+        self.marks.setdefault(event, time.perf_counter())
 
     @property
     def group_count(self) -> int:
@@ -136,7 +147,18 @@ class LayerwiseStoragePipeline:
         target,
         host_resource_id: str,
     ) -> LayerwiseTransaction:
-        """Open a transaction and submit the admission-critical first group."""
+        """Open a transaction and hand the backend the whole read plan.
+
+        Group 0 goes out at admission priority and the rest at read-ahead, all
+        at once. Submitting the rest only after group 0 lands looks like
+        prudence and is not: nothing but the scheduler thread can notice that
+        group 0 landed, and it only looks once per iteration, so the disks sat
+        idle for a whole scheduler pass between the two submissions -- measured
+        at ~132 ms of a 171 ms read, which is also why that read reported 7.3
+        GiB/s when the device does 35. The arbiter keeps group 0 ahead of the
+        rest by priority and reserves submission slots for it, so ordering does
+        not need a barrier to enforce it.
+        """
         handle = self._backend.begin_read(
             transaction_id=transaction_id,
             generation=generation,
@@ -154,15 +176,28 @@ class LayerwiseStoragePipeline:
         transaction.machine.advance(TransactionState.HOST_PRIVATE_ALLOCATED)
         transaction.machine.advance(TransactionState.READING_GROUP0)
         self._submit_group(transaction, group_id=0, priority=_ADMISSION_PRIORITY)
+        while transaction.next_submit_group_id < transaction.group_count:
+            self._submit_group(
+                transaction,
+                group_id=transaction.next_submit_group_id,
+                priority=_READ_AHEAD_PRIORITY,
+            )
+        transaction.mark("rest_submitted")
         return transaction
 
     def advance(self, transaction: LayerwiseTransaction) -> None:
-        """One non-blocking step: drain, agree, hand off, then read ahead."""
+        """One non-blocking step: drain completions, agree, hand off to H2D.
+
+        Submission is not here: the whole plan went to the arbiter in
+        ``begin``, so a slow visit from the scheduler thread delays the
+        admission decision but no longer stalls the reader.
+        """
         if transaction.machine.state in (
             TransactionState.ABORTED,
             TransactionState.DONE,
         ):
             return
+        transaction.marks["advances"] = transaction.marks.get("advances", 0) + 1
         self._drain_completions(transaction)
         if transaction.aborted:
             return
@@ -171,7 +206,6 @@ class LayerwiseStoragePipeline:
             return
         self._advance_consensus(transaction)
         self._advance_h2d(transaction)
-        self._advance_read_ahead(transaction)
         self._advance_transaction_state(transaction)
 
     def note_device_allocated(
@@ -255,6 +289,8 @@ class LayerwiseStoragePipeline:
     ) -> None:
         group_machine = transaction.machine.group(group_id)
         group_machine.submit()
+        if group_id == 0:
+            transaction.mark("g0_submitted")
         self._backend.submit_group(
             handle=transaction.handle,
             group=transaction.plan.groups[group_id],
@@ -314,6 +350,8 @@ class LayerwiseStoragePipeline:
             group = transaction.machine.group(transaction.next_consensus_group_id)
             if group.state is not GroupState.LOCAL_DONE:
                 break
+            if group.plan.group_id == 0:
+                transaction.mark("g0_local_done")
             group.begin_consensus()
             self._consensus.begin(
                 transaction_id=transaction.transaction_id,
@@ -338,6 +376,8 @@ class LayerwiseStoragePipeline:
                 )
                 return
             group.mark_global_ready()
+            if group.plan.group_id == 0:
+                transaction.mark("g0_global_ready")
 
     def _advance_h2d(self, transaction: LayerwiseTransaction) -> None:
         """Hand agreed groups to the H2D stream in strict plan order."""
@@ -354,43 +394,49 @@ class LayerwiseStoragePipeline:
             transaction.next_h2d_group_id += 1
         transaction.machine.retire_ready_groups()
 
-    def _advance_read_ahead(self, transaction: LayerwiseTransaction) -> None:
-        """Submit every remaining group once group 0 is in hand.
-
-        Read-ahead is continuous and has no group-count window: the reader runs
-        to the end of the transaction and the arbiter is the only backpressure,
-        throttling on its in-flight byte budget and queue depth. Submission is
-        cheap -- it appends to the arbiter's priority queue -- so the cost of
-        running the whole plan ahead is bounded by what the arbiter admits, not
-        by how many groups have been handed to it.
-
-        The group timeout is armed at the retirement frontier rather than here
-        (see ``_enforce_deadlines``): a group queued behind the frontier can
-        legitimately wait far longer than one group's timeout.
-        """
-        if not transaction.admission_ready and not self._group0_local_done(transaction):
-            return
-        while transaction.next_submit_group_id < transaction.group_count:
-            self._submit_group(
-                transaction,
-                group_id=transaction.next_submit_group_id,
-                priority=_READ_AHEAD_PRIORITY,
-            )
-
     def _advance_transaction_state(self, transaction: LayerwiseTransaction) -> None:
         machine = transaction.machine
         if machine.state is TransactionState.READING_GROUP0:
             if self._group0_ready(transaction):
                 machine.advance(TransactionState.ADMISSION_READY)
                 transaction.admitted_at = time.monotonic()
+                transaction.mark("admission_ready")
+                self._report_admission(transaction)
             return
         if machine.state is TransactionState.STREAMING and machine.all_groups_retired:
             machine.advance(TransactionState.STORAGE_COMPLETE)
 
-    def _group0_local_done(self, transaction: LayerwiseTransaction) -> bool:
-        return transaction.machine.group(0).state not in (
-            GroupState.PLANNED,
-            GroupState.SUBMITTED,
+    def _report_admission(self, transaction: LayerwiseTransaction) -> None:
+        """One line per transaction, at the moment admission is decided.
+
+        Every mark is an offset from group 0's submission, so "did group 0 gate
+        this, or did the whole read" is answered by comparing two numbers
+        rather than by reading the state machine. ``advances`` counts the
+        scheduler-thread visits it took to get here, which is what separates a
+        slow read from a rendezvous that came late.
+        """
+        from sglang.srt.observability.req_time_stats import convert_time_to_realtime
+
+        base = transaction.marks.get("g0_submitted")
+        if base is None:
+            return
+
+        def offset(event: str) -> float:
+            mark = transaction.marks.get(event)
+            return -1.0 if mark is None else (mark - base) * 1e3
+
+        logger.info(
+            "layerwise_admit: txn=%s groups=%d advances=%d g0_submit=%.3f "
+            "g0_local_done=+%.2f g0_global_ready=+%.2f rest_submitted=+%.2f "
+            "admission_ready=+%.2f",
+            transaction.transaction_id,
+            transaction.group_count,
+            transaction.marks.get("advances", 0),
+            convert_time_to_realtime(base),
+            offset("g0_local_done"),
+            offset("g0_global_ready"),
+            offset("rest_submitted"),
+            offset("admission_ready"),
         )
 
     def _group0_ready(self, transaction: LayerwiseTransaction) -> bool:
