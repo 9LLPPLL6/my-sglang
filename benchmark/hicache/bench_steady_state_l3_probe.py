@@ -38,6 +38,7 @@ import statistics as st
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -257,21 +258,59 @@ def run_arm(arm, port, proc, args, rng, store_root, log_path):
     before_log = B.log_counts(log_path)
     log_offset = log_path.stat().st_size
 
-    B.log(f"[{arm}] firing {args.probes} probes, one at a time")
-    probes = []
-    for index, prefix in enumerate(prefixes):
-        suffix = B.gen_ids(args.suffix_tokens, rng) if args.suffix_tokens else []
-        res = B.generate(port, list(prefix) + suffix)
-        probes.append(
-            {"ttft_ms": round(res["ttft_ms"], 1), "tier": B.tier(res["meta"])}
+    conc = max(1, args.probe_concurrency)
+    B.log(f"[{arm}] firing {args.probes} probes, {conc} at a time")
+    suffixes = [
+        B.gen_ids(args.suffix_tokens, rng) if args.suffix_tokens else []
+        for _ in prefixes
+    ]
+    probes = [None] * len(prefixes)
+
+    def fire(index):
+        res = B.generate(port, list(prefixes[index]) + suffixes[index])
+        return index, {
+            "ttft_ms": round(res["ttft_ms"], 1),
+            "tier": B.tier(res["meta"]),
+        }
+
+    # Waves of `conc`. At conc=1 this is the original one-at-a-time loop; above
+    # it, every probe in a wave has its prefetch in flight at the same time,
+    # which is the whole point -- a single streaming slot means all but one of
+    # them fall back to the blocking read, and they contend for the device.
+    for start in range(0, len(prefixes), conc):
+        wave = range(start, min(start + conc, len(prefixes)))
+        if conc == 1:
+            for index in wave:
+                index, rec = fire(index)
+                probes[index] = rec
+        else:
+            with ThreadPoolExecutor(max_workers=conc) as pool:
+                for index, rec in pool.map(fire, wave):
+                    probes[index] = rec
+        done = [probes[i]["ttft_ms"] for i in wave]
+        B.log(
+            f"  probes {start + 1}-{start + len(done)}/{args.probes}: "
+            + " ".join(f"{t:.0f}" for t in done)
+            + " ms"
         )
-        B.log(f"  probe {index + 1}/{args.probes}: {probes[-1]['ttft_ms']:.0f} ms")
         time.sleep(args.probe_gap_s)
 
     bg_stats = background.stats()
     background.shutdown()
 
     reads, _ = B.read_lines_since(log_path, log_offset)
+    # Which read path each probe actually took. A streaming take-over logs one
+    # `layerwise_admit` per rank; a request the bridge refused (its one slot
+    # being busy) falls back and logs `layerwise_file read:` instead.
+    with log_path.open("rb") as handle:
+        handle.seek(log_offset)
+        tail = handle.read().decode("utf-8", "replace")
+    paths = {
+        "streamed": tail.count("layerwise_admit:"),
+        "fell_back": tail.count("layerwise_file read:"),
+        "ranks": args.tp_size,
+    }
+    B.log(f"[{arm}] 路径计数（含每 rank 一条）: {paths}")
     complaints = check_tiers(arm, probes, hit)
     for complaint in complaints:
         B.log(f"  !! [{arm}] {complaint}")
@@ -282,6 +321,8 @@ def run_arm(arm, port, proc, args, rng, store_root, log_path):
         "suffix_tokens": args.suffix_tokens,
         "probes": args.probes,
         "background": bg_stats,
+        "probe_concurrency": conc,
+        "read_paths": paths,
         "disk_read_bytes": B.tree_read_bytes(proc.pid) - before_io,
         "expect_kv_bytes": expect_kv,
         "log_delta": {
@@ -350,6 +391,14 @@ def main():
     extra.add_argument("--background-output-tokens", type=int, default=20000)
     extra.add_argument("--background-warmup-s", type=float, default=8.0)
     extra.add_argument("--probe-gap-s", type=float, default=2.0)
+    extra.add_argument(
+        "--probe-concurrency",
+        type=int,
+        default=1,
+        help="probes fired simultaneously; >1 puts that many L3 prefetches in "
+        "flight at once, which is what the single streaming slot and the "
+        "device bandwidth are then shared between",
+    )
     known, rest = extra.parse_known_args()
     sys.argv = [sys.argv[0]] + rest
 
@@ -357,7 +406,9 @@ def main():
     for key, value in vars(known).items():
         setattr(args, key, value)
     args.hit_tokens = int(str(args.hit_tokens).split(",")[0])
-    patch_base_args(args.background_requests + 2)
+    # The probes have to fit alongside the background population, or a wave
+    # queues on scheduling slots and the measurement is about that instead.
+    patch_base_args(args.background_requests + max(1, args.probe_concurrency) + 1)
 
     rng = random.Random(args.seed)
     run_dir = B.RESULTS_ROOT / (

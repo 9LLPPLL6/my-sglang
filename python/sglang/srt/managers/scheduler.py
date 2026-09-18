@@ -4469,10 +4469,49 @@ class Scheduler(
                 logger.info("Cache flushed successfully!")
             success = True
         else:
+            # Naming only the two request counts is a dead end when neither is
+            # the blocker: the refusal then reads "pending requests, 0 pending".
+            # Report every clause that is actually holding it.
+            blockers = [
+                name
+                for name, blocked in (
+                    ("running_batch", not self.running_batch.is_empty()),
+                    ("chunked_req", self.chunked_req is not None),
+                    ("dllm_staging", self.dllm_manager.any_staging_reqs()),
+                    (
+                        "last_batch",
+                        self.last_batch is not None and not self.last_batch.is_empty(),
+                    ),
+                    (
+                        "overlap_results",
+                        self.enable_overlap and len(self.result_queue) > 0,
+                    ),
+                    ("pp_microbatches", not self._pp_microbatches_drained()),
+                    ("waiting_queue", len(self.waiting_queue) > 0),
+                    (
+                        "grammar_queue",
+                        len(self.grammar_manager.grammar_queue) > 0,
+                    ),
+                )
+                if blocked
+            ]
+            if self.enable_hierarchical_cache:
+                tc = self.tree_cache
+                counts = [
+                    ("ongoing_write_through", len(tc.ongoing_write_through)),
+                    ("ongoing_load_back", len(tc.ongoing_load_back)),
+                ]
+                if tc.enable_storage:
+                    counts += [
+                        ("ongoing_prefetch", len(tc.ongoing_prefetch)),
+                        ("ongoing_backup", len(tc.ongoing_backup)),
+                    ]
+                blockers += [f"{name}={n}" for name, n in counts if n]
             logging.warning(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.waiting_queue)}, "
-                f"#running-req: {len(self.running_batch.reqs)}"
+                f"#running-req: {len(self.running_batch.reqs)}, "
+                f"blocked_by: {blockers or ['(none of the reported clauses)']}"
             )
             success = False
         return success
