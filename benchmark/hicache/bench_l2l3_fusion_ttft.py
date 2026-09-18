@@ -318,6 +318,12 @@ def base_args(args, port: int) -> list[str]:
         "--hicache-io-backend", "direct",
         "--hicache-mem-layout", "page_first_direct",
         "--hicache-host-memory-mode", "cache",
+        # One line per finished request on rank 0, splitting its latency into
+        # queue_duration (everything before admission -- for the L3 arms, the
+        # prefetch wait) and forward_duration (the prefill itself, where the
+        # layer gate blocks). That split is what attributes an L3-vs-L2 delta
+        # to admission or to the forward, so it is on for every arm.
+        "--enable-request-time-stats-logging",
     ]
 
 
@@ -940,11 +946,10 @@ def parse_args():
     p.add_argument("--churn-file", default="/zion0/kv-aio-bench/churn.bin")
 
     p.add_argument("--io-threads", type=int, default=1,
-                   help="--hicache-storage-io-threads for the l3_nopipe server. "
-                        "Shards one whole-prefix read across that many AIO "
-                        "contexts; a parallel filesystem needs it to reach its "
-                        "aggregate bandwidth. Refused by the layerwise path, so "
-                        "it is passed to the full_wait server only")
+                   help="--hicache-storage-io-threads. Shards a read across "
+                        "that many AIO contexts; a parallel filesystem needs it "
+                        "to reach its aggregate bandwidth. Applies to both read "
+                        "paths: the whole-prefix one and the streaming one")
     p.add_argument("--warm-step", type=int, default=16384,
                    help="grow the prefix this many tokens per warm-up request. "
                         "Keeps every write-phase prefill small enough to stay "

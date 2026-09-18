@@ -390,18 +390,32 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
         pipeline's group-by-group pacing as well as the I/O -- which is the
         point: the gap between this GiB/s and the device's is what the pacing
         costs.
+
+        ``start``/``end`` are the same wall clock the per-request time stats
+        print their ``entry_time`` in, and they answer a question the span
+        cannot: the read does not begin when the request is enqueued but when
+        the scheduler thread next drains the storage-hit queue, so
+        ``start - entry_time`` is how much of a prefetch's latency is spent
+        waiting to be started at all. This line is emitted at transaction
+        close, which for a streaming read is long after the read ended, so the
+        log's own timestamp cannot stand in for either end of the span.
         """
         if state.extents_done == 0 or state.last_complete_s <= state.first_submit_s:
             return
         span_s = state.last_complete_s - state.first_submit_s
         open_ms = state.open_ns / 1e6
+        # Imported here rather than at module scope: the time-stats module
+        # pulls in the metrics collector and forward-batch types, which a
+        # storage backend has no business importing on the way up.
+        from sglang.srt.observability.req_time_stats import convert_time_to_realtime
         shards = ",".join(
             f"{index}:{state.shard_bytes.get(index, 0)}"
             for index in range(self._io_threads)
         )
         logger.info(
             "layerwise_stream read: txn=%s pages=%d extents=%d bytes=%d "
-            "ms=%.2f open_ms=%.2f GiB/s=%.2f threads=%d shard_bytes=%s",
+            "ms=%.2f open_ms=%.2f GiB/s=%.2f threads=%d start=%.3f end=%.3f "
+            "shard_bytes=%s",
             transaction_id,
             len(state.shard_of_page),
             state.extents_done,
@@ -410,6 +424,8 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
             open_ms,
             state.bytes_done / span_s / (1 << 30),
             self._io_threads,
+            convert_time_to_realtime(state.first_submit_s),
+            convert_time_to_realtime(state.last_complete_s),
             shards,
         )
 
