@@ -319,8 +319,20 @@ def page_relative_path(
 
 
 def _sanitize_page_key(page_key: str) -> str:
-    """Map a HiCache page key onto a filesystem-safe, collision-free name."""
-    if all(character.isalnum() or character in "-_" for character in page_key):
+    """Map a HiCache page key onto a filesystem-safe, collision-free name.
+
+    The character scan runs at C speed rather than as a generator over the
+    string: this is called once per extent, and on a trace of eight 16k-token
+    prefixes it spent 330k `isalnum` calls on the scheduler thread deciding
+    that SHA-256 hex is, as ever, alphanumeric.
+
+    Stripping the two allowed punctuation characters first keeps the predicate
+    identical to the per-character one, including its two edge cases -- an
+    empty key, and a key made only of `-` and `_`, both of which the old `all`
+    accepted vacuously and `str.isalnum` would reject.
+    """
+    stripped = page_key.replace("-", "").replace("_", "")
+    if not stripped or stripped.isalnum():
         return page_key
     return hashlib.sha256(page_key.encode("utf-8")).hexdigest()
 
