@@ -9,6 +9,7 @@
 | 探针 | 命中前缀 16384 token + 新后缀 512 token，page 512 |
 | 补丁 | `benchmark/hicache/fake_storage_io.patch`（不常驻仓库） |
 | 前一阶段 | [11 page size 与前缀长度](11-page-size-and-prefix-length.md) |
+| 后续 | §4 指出的那行同步**已修复并实测**（commit `68792b8455`），见文末「已修复」 |
 
 > 前面十一个阶段一直在间接论证"L3 的开销不是存储"：换个办法让读变快，看 TTFT 不跟。
 > 这一阶段**把磁盘直接去掉**，再把背景请求也去掉，于是剩下的只有 L3 的代码路径。
@@ -96,6 +97,9 @@
 
 ## 4. 那 46 ms 的大头是一行防御性检查
 
+> **本节描述的是修复前的状态。** 这一行已经改掉了，纯代码路径从 46 ms 降到
+> 19 ms，见文末「已修复」。下面保留原样，因为定位过程本身比结论有用。
+
 把⑤→⑦（流水线说"好了"到请求真正进批次）拆开。这一段是 `radix_bridge.init_load_back` 在做的事：
 
 | 步骤 | 耗时 |
@@ -154,8 +158,8 @@ if len(match.device_indices) < span_end or not torch.equal(canonical, device_ind
 优化天花板由此确定：
 
 ```
-流水线内部（分组 / extent 粒度 / 并发流 / 多线程）   ≤ 46 ms
-  └ 其中一半以上是那一行同步                        23–45 ms
+流水线内部（分组 / extent 粒度 / 并发流 / 多线程）   ≤ 46 ms  →  修复后 ≤ 19 ms
+  └ 其中一半以上是那一行同步                        23–45 ms  →  已消除
 存储与带宽                                          ≤ 17 ms
 准入时机（预分配 / 提前预取 / 主动唤醒）             117 – 516 ms
 ```
@@ -167,7 +171,9 @@ if len(match.device_indices) < span_end or not torch.equal(canonical, device_ind
 ## 6. 不确定的地方
 
 1. **`torch.equal` 等的到底是哪些 GPU 工作，没有查清。** 候选是这笔事务自己刚发起的 H2D 拷贝（第 0 组 128 MiB/卡）和插树产生的 GPU 操作，但我没有用 CUDA event 定位过。
-2. **修法未验证。** 想到三条（在 CPU 侧比、记 event 在层门第一次等待时顺带校验、论证不变量已由锁引用计数保证），都没做。哪条可行取决于槽位所有权的具体保证。
+2. ~~**修法未验证。**~~ **已修复并实测**，见文末。当时列的三条候选（在 CPU 侧比、
+   记 event 延后校验、论证不变量已被覆盖）**都不是最后采用的那条**——真正的答案是
+   第四条：`insert` 自己就报告了去重，根本不需要事后检查。
 3. **零 IO 下缓冲区是陈旧字节**，理论上随机比特可能解出 NaN/Inf 影响 kernel 时间。张量核矩阵乘是定长的，风险很低，但没有单独验证。
 4. **L2 基线是"同一台开着 L3 的机器上的 L2 命中"**，不是"不开 L3"。开启 L3 对 L2 命中本身的代价（那次落空查询）另计——无背景时≈0，有背景时约一轮调度（阶段 09 测得 128 ms）。
 5. **每档单次运行**，8 个探针。标准差 5.0 / 5.5 / 8.5 ms，相对 46 和 17 这两个差值足够小。
@@ -198,3 +204,90 @@ git apply -R benchmark/hicache/fake_storage_io.patch
 准入内部的六段计时（§4 那张表）需要另一段临时埋点，加在 `radix_bridge.init_load_back` 里，跑完撤掉——本文档写作时用的就是这种方式，没有留在仓库里。
 
 原始数据：`benchmark/hicache/results/l2l3_fusion/nobg-{realio,fakeio,admitwork,syncsplit}/`
+
+---
+
+## 8. 已修复：问 insert，而不是事后同步去查
+
+commit `68792b8455`。
+
+### 答案不在当时列的三条候选里
+
+§6 局限 2 当时想到三条修法（在 CPU 侧比、记 CUDA event 延后校验、论证不变量已被覆盖），
+**没有一条是最后采用的**。真正的答案是第四条，而且它一直摆在那儿：
+
+**`insert` 自己就报告了去重，根本不需要事后去查。**
+
+```python
+# unified_tree_core.py:1022
+state.result = InsertResult(
+    prefix_len=state.total_prefix_length,    # 走树时累加的"和已有内容重合的长度"
+    last_device_node=state.target_node.id,
+)
+```
+
+而且树**只释放超出 `prev_prefix_len` 的那段**——`prev_prefix_len` 正是 bridge 一直在传的
+`staged.matched_len`：
+
+```python
+# unified_tree_core.py:_insert_walk_step
+dup_start = max(0, state.params.prev_prefix_len - state.total_prefix_length)
+if dup_start < consumed_from:
+    step_actions.append(FreeDeviceKV([value_slice[dup_start:consumed_from]]))
+```
+
+`FreeDeviceKV` 就是原错误信息里说的 "the insert freed or replaced slots"。**危险是树自己
+制造的，而它完全知道自己做了这件事**——bridge 却把返回值丢掉，再用一次
+`match_prefix` + `torch.equal` 去问"刚才发生了什么"。
+
+既有测试 `test_prev_prefix_len`（`test_unified_radix_cache_unittest.py`）已经在树层面
+证明了等价关系：
+
+| | `prev_prefix_len` | `result.prefix_len` | 是否释放新槽位 |
+|---|---|---|---|
+| Step 2 | 0 | 1 page | **释放 1 page** |
+| Step 3 | 2 pages | 2 pages | **零释放** |
+
+所以 `prefix_len != matched_len` 和原来那个张量比对是**同一个判据**。
+
+### 改动
+
+```python
+# 改前
+cache.insert(InsertParams(key=key, value=..., prev_prefix_len=staged.matched_len))
+match = cache.match_prefix(MatchPrefixParams(key=key))
+canonical = match.device_indices[staged.matched_len : span_end]
+if len(match.device_indices) < span_end or not torch.equal(canonical, device_indices):
+    raise LayerwiseStreamError(...)
+return InitLoadBackResult(device_indices=canonical, last_node=match.last_device_node, ...)
+
+# 改后
+result = cache.insert(InsertParams(key=key, value=..., prev_prefix_len=staged.matched_len))
+if result.prefix_len != staged.matched_len:
+    raise LayerwiseStreamError(...)
+return InitLoadBackResult(device_indices=device_indices, last_node=result.last_device_node, ...)
+```
+
+去掉了：**一次全设备同步、一次全量 `match_prefix`、一次张量切片**。`last_device_node`
+直接从 `InsertResult` 拿。
+
+### 实测（零 IO、无背景、单请求，8 个探针均值）
+
+| | L2 queue | L3 queue | **Δq** | L3 forward | 读盘 |
+|---|---|---|---|---|---|
+| 改前 | 1.6 | 47.5 | **45.9** | 282.8 | 0.00 G |
+| **改后** | 1.6 | **20.8** | **19.2** | 283.0 | 0.00 G |
+
+**−26.7 ms，降 58%。** L2 基线和两臂 forward 都没动，改善全部落在 L3 的 queue 上。
+
+### 顺带补了覆盖
+
+`init_load_back` **之前完全没有单测**——bridge 的 fake cache 里既没有 `insert` 也没有
+`match_prefix`。新增两个用例：去重时拒绝、未去重时保留槽位，并断言 `match_prefix`
+调用次数为 1，钉住第二次匹配确实被删了。
+
+### 剩下的 19 ms
+
+无背景单请求下 L3 相对 L2 还剩 19 ms 的纯代码路径开销，分布在：查存储、分配 host、
+建计划、提交 640 个 extent、仲裁器、状态机、共识、准入。**没有单独一项占主导**，
+继续压需要逐项抠，性价比远低于准入时机那 117–516 ms。
