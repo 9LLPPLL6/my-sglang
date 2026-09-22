@@ -105,6 +105,41 @@ def _fake_cache():
     )
 
 
+def _equip_for_load_back(cache, *, matched_len, num_tokens, insert_prefix_len):
+    """Give the fake cache what `init_load_back` reaches for.
+
+    `insert` is the interesting one: it reports how much of the inserted key
+    overlapped something already in the tree, which is how the bridge learns
+    whether its freshly allocated device slots were kept or freed.
+    """
+    from sglang.srt.mem_cache.base_prefix_cache import InsertResult
+
+    device_slots = torch.arange(1000, 1000 + num_tokens, dtype=torch.int64)
+    matched = torch.arange(matched_len, dtype=torch.int64)
+    cache.tree_core.empty_match_result = SimpleNamespace(
+        device_indices=torch.empty(0, dtype=torch.int64)
+    )
+    cache.tree_core.is_eagle = False
+    cache.match_prefix = mock.Mock(
+        return_value=SimpleNamespace(
+            device_indices=matched,
+            full_kv_hit_length=matched_len,
+            last_device_node="pre-existing-node",
+        )
+    )
+    cache._component_available_size = mock.Mock(return_value=num_tokens)
+    cache.token_to_kv_pool_allocator = SimpleNamespace(
+        alloc=mock.Mock(return_value=device_slots)
+    )
+    cache.evict_for_alloc = mock.Mock()
+    cache.insert = mock.Mock(
+        return_value=InsertResult(
+            prefix_len=insert_prefix_len, last_device_node="published-node"
+        )
+    )
+    return device_slots, matched
+
+
 def _stage(bridge, cache, controller, *, req_id="req-0"):
     num_tokens = _PAGES * _PAGE_SIZE
     prefetch_key = mock.MagicMock()
@@ -196,6 +231,70 @@ class TestLayerwiseRadixBridge(CustomTestCase):
         self.assertTrue(self.bridge.try_finish_load_back(-(staged.operation_id) - 1))
 
         self.assertNotIn(req_id, self.cache.prefetch_loaded_tokens_by_reqid)
+
+    def test_admission_keeps_its_slots_when_the_insert_found_nothing(self):
+        """The published span was new, so the allocated device slots stand.
+
+        The check reads the insert's own report instead of re-matching the tree
+        and comparing two device tensors: that comparison returns a Python bool
+        and therefore synchronizes the GPU, which cost 23-45 ms on the scheduler
+        thread against 0.11 ms for the comparison itself.
+        """
+        from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+
+        req_id, num_tokens = _stage(self.bridge, self.cache, self.controller)
+        staged = self.bridge._staged[req_id]
+        self.controller.attach_device = mock.Mock()
+        self.controller.consumer_index = mock.Mock(return_value=0)
+        slots, matched = _equip_for_load_back(
+            self.cache,
+            matched_len=staged.matched_len,
+            num_tokens=num_tokens,
+            insert_prefix_len=staged.matched_len,
+        )
+        self.controller.transaction.admission_ready = True
+        req = SimpleNamespace(rid=req_id, prefix_indices=matched, last_node=None)
+
+        result = self.bridge.init_load_back(
+                InitLoadBackParams(req=req, best_match_node=None, host_hit_length=0)
+            )
+
+        self.assertIs(result.device_indices, slots)
+        self.assertEqual(result.last_node, "published-node")
+        self.assertEqual(
+            self.cache.match_prefix.call_count,
+            1,
+            "only the pre-insert span check matches; the post-insert one is gone",
+        )
+
+    def test_admission_refuses_when_the_insert_deduplicated_the_span(self):
+        """A span published twice frees the slots the L2->L1 copy is writing into.
+
+        `prefix_len` past `matched_len` is exactly the range the tree emits
+        `FreeDeviceKV` for, so it is the signal that those slots are gone.
+        """
+        from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+        from sglang.srt.mem_cache.layerwise_storage.radix_bridge import (
+            LayerwiseStreamError,
+        )
+
+        req_id, num_tokens = _stage(self.bridge, self.cache, self.controller)
+        staged = self.bridge._staged[req_id]
+        self.controller.attach_device = mock.Mock()
+        self.controller.consumer_index = mock.Mock(return_value=0)
+        _, matched = _equip_for_load_back(
+            self.cache,
+            matched_len=staged.matched_len,
+            num_tokens=num_tokens,
+            insert_prefix_len=staged.matched_len + _PAGE_SIZE,
+        )
+        self.controller.transaction.admission_ready = True
+        req = SimpleNamespace(rid=req_id, prefix_indices=matched, last_node=None)
+
+        with self.assertRaisesRegex(LayerwiseStreamError, "ownership violation"):
+            self.bridge.init_load_back(
+                InitLoadBackParams(req=req, best_match_node=None, host_hit_length=0)
+            )
 
     def test_finishing_a_stream_clears_the_shared_layer_gate_pump(self):
         req_id, _ = _stage(self.bridge, self.cache, self.controller)

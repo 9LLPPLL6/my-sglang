@@ -277,7 +277,6 @@ class LayerwiseRadixBridge:
             extra_key=staged.extra_key,
             is_bigram=cache.tree_core.is_eagle,
         ).page_aligned(self.page_size)
-        span_end = staged.matched_len + staged.num_tokens
 
         live = cache.match_prefix(MatchPrefixParams(key=key))
         if (
@@ -308,26 +307,37 @@ class LayerwiseRadixBridge:
         counter.stream_pump = self._pump
         staged.admitted = True
 
-        cache.insert(
+        result = cache.insert(
             InsertParams(
                 key=key,
                 value=torch.cat([req.prefix_indices, device_indices]),
                 prev_prefix_len=staged.matched_len,
             )
         )
-        match = cache.match_prefix(MatchPrefixParams(key=key))
-        canonical = match.device_indices[staged.matched_len : span_end]
-        if len(match.device_indices) < span_end or not torch.equal(
-            canonical, device_indices
-        ):
+        # Ask the insert what it did rather than inspecting the tree afterwards.
+        # An insert that finds this span already published keeps the existing
+        # slots and frees the ones just allocated (`FreeDeviceKV`, emitted for
+        # exactly the range past `prev_prefix_len`) -- while the L2->L1 copy is
+        # still writing into them. `prefix_len` is the length that overlapped
+        # something already there, so anything beyond `matched_len` is a span
+        # that was published twice.
+        #
+        # The previous check re-matched the tree and compared the two index
+        # tensors with `torch.equal`. Both live on the device, and a comparison
+        # that returns a Python bool has to synchronize: measured at 23-45 ms on
+        # the scheduler thread, against 0.11 ms for the comparison itself. That
+        # is a full GPU wait inserted before the forward the pipeline exists to
+        # overlap with.
+        if result.prefix_len != staged.matched_len:
             raise LayerwiseStreamError(
                 f"layerwise load-back ownership violation req={staged.req_id}: "
-                "the insert freed or replaced slots the in-flight streaming H2D "
-                "still targets"
+                f"the insert matched {result.prefix_len} tokens against the tree "
+                f"where {staged.matched_len} were expected, so it freed slots the "
+                "in-flight streaming H2D still targets"
             )
         return InitLoadBackResult(
-            device_indices=canonical,
-            last_node=match.last_device_node,
+            device_indices=device_indices,
+            last_node=result.last_device_node,
             ownership=LoadBackOwnership.TREE,
         )
 
