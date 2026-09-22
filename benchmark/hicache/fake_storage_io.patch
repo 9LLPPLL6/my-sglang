@@ -1,0 +1,108 @@
+# 实验补丁：把 L3 存储读的耗时置零，用来量"L3 代码路径本身值多少"。
+#
+# 不在仓库里常驻。跑实验时打上，跑完撤下：
+#
+#     git apply benchmark/hicache/fake_storage_io.patch
+#     SGLANG_TEST_HICACHE_FAKE_STORAGE_IO=1 <bench ...>
+#     git apply -R benchmark/hicache/fake_storage_io.patch
+#
+# 短路点在最内层：LinuxAioContext._submit 不下发 io_submit，直接把请求登记成
+# 已完成；_get_events 从伪队列取。仲裁器、队列深度、分片、扩展区状态机、
+# 共识、准入门控、层门、H2D 全部照常执行——唯一不发生的是内核那一步。
+#
+# 缓冲区里是未初始化的数据，所以这一轮的生成文本无意义，只有延迟数字可用。
+# 硬证据是进程级读盘计数器：实测 0.00 GiB / 预期 20.00 GiB。
+#
+# 2026-09-22 实测（并发 8、流式槽位 8、page 512、前缀 16384）：
+#     真 L3   Δqueue = 585 / 590 ms   读盘 20.00 GiB
+#     假 L3   Δqueue = 519 ms         读盘  0.00 GiB
+#   → IO 占 L3 总开销的约 12%，其余 88% 是代码路径与调度时机。
+
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 5fabffcfcf..57ef5f4253 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -394,6 +394,11 @@ class Envs:
+     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
+     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
+     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
++    # HiCache: complete every storage read instantly instead of issuing it, so
++    # the L3 code path can be timed with its I/O removed rather than inferred.
++    # The target buffers keep whatever they held; only latency measurements are
++    # meaningful under this flag, never generated text.
++    SGLANG_TEST_HICACHE_FAKE_STORAGE_IO = EnvBool(False)
+     SGLANG_TEST_RETRACT = EnvBool(False)
+     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
+     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2**31)
+diff --git a/python/sglang/srt/mem_cache/layerwise_storage/aio_engine.py b/python/sglang/srt/mem_cache/layerwise_storage/aio_engine.py
+index fb4dbc9f69..4e44405b11 100644
+--- a/python/sglang/srt/mem_cache/layerwise_storage/aio_engine.py
++++ b/python/sglang/srt/mem_cache/layerwise_storage/aio_engine.py
+@@ -20,11 +20,17 @@ from __future__ import annotations
+ import ctypes
+ import ctypes.util
+ import errno
++import logging
+ import os
+ import platform
+ import threading
++from collections import deque
+ from typing import NamedTuple, Optional
+ 
++from sglang.srt.environ import envs
++
++logger = logging.getLogger(__name__)
++
+ DEFAULT_ALIGNMENT = 4096
+ _ALIGNMENT_CANDIDATES = (512, 4096, 16384, 65536)
+ 
+@@ -166,6 +172,16 @@ class LinuxAioContext:
+         self._lock = threading.Lock()
+         self._inflight = 0
+         self._closed = False
++        # Read once: flipping this mid-flight would strand kernel completions
++        # in a context that has stopped polling for them.
++        self._fake_io = envs.SGLANG_TEST_HICACHE_FAKE_STORAGE_IO.get()
++        self._fake_completions: deque[AioCompletion] = deque()
++        if self._fake_io:
++            logger.warning(
++                "SGLANG_TEST_HICACHE_FAKE_STORAGE_IO is set: layerwise storage "
++                "reads complete without touching the device. Latency numbers "
++                "are meaningful, generated text is not."
++            )
+         # Keep submitted iocbs alive until their completion is drained; the
+         # kernel dereferences them and Python would otherwise free them.
+         self._pending: dict[int, _IOCB] = {}
+@@ -247,6 +263,18 @@ class LinuxAioContext:
+             return 0
+ 
+         batch = requests[:capacity]
++        if self._fake_io:
++            # Diagnostic mode: the request is retired without ever reaching the
++            # kernel, so the read costs nothing and what remains in a
++            # measurement is the L3 path itself. Buffers are left untouched.
++            with self._lock:
++                self._fake_completions.extend(
++                    AioCompletion(user_data=user_data, result=nbytes)
++                    for _, _, nbytes, _, user_data in batch
++                )
++                self._inflight += len(batch)
++            return len(batch)
++
+         blocks = []
+         for fd, ptr, nbytes, offset, user_data in batch:
+             block = _IOCB()
+@@ -296,6 +324,13 @@ class LinuxAioContext:
+                 return ()
+             if self._inflight == 0:
+                 return ()
++            if self._fake_io:
++                taken = [
++                    self._fake_completions.popleft()
++                    for _ in range(min(limit, len(self._fake_completions)))
++                ]
++                self._inflight -= len(taken)
++                return tuple(taken)
+         timeout = None
+         if timeout_s is not None:
+             timeout = _Timespec(
