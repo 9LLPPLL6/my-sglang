@@ -1,0 +1,89 @@
+# 扫描埋点：等待队列一趟扫描做了什么、花了多久
+#
+# 只在做实验时打上，不进运行时代码。
+#   打上:  git apply benchmark/hicache/scan_probe.patch
+#   撤销:  git apply -R benchmark/hicache/scan_probe.patch
+#
+# 在 get_new_batch_prefill 的等待队列循环结束后打一行：
+#   scan: queued=N visited=N skip_prefetch=N added=N stop=... check_ms=.. add_ms=..
+#
+# visited       循环实际访问到的请求数
+# skip_prefetch check_prefetch_progress 返回 False 而被 continue 的数量
+# stop          ran-to-end / break:batch_is_full / break:add_one_req=<原因>
+# check_ms      花在 check_prefetch_progress 上的总时间
+# add_ms        花在 init_next_round_input + add_one_req 上的总时间
+#
+# 实测（并发 8、命中前缀 16384、背景 6 路、max_concurrent_streams 8）：
+#   scan: queued=8 visited=8 skip_prefetch=8 added=0 stop=ran-to-end check_ms=1.2  add_ms=0.0
+#   scan: queued=8 visited=8 skip_prefetch=0 added=8 stop=ran-to-end check_ms=63.3 add_ms=160.3
+# 同一日志里 L2 臂 8 个探针分两趟进：add_ms 合计 6.1 ms。
+# 即 L3 每请求准入开销 20.0 ms，L2 0.76 ms。结论见 L2L3fusion-docs/13-*.md
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 10a05f8a12..79a168c613 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3410,9 +3410,13 @@ class Scheduler(
+         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+         if mamba_allocator is not None:
+             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
++        _scan = [0, 0, 0, "ran-to-end"]   # visited, skip_lora, skip_prefetch, stop
++        _t = [0.0, 0.0]   # seconds in check_prefetch_progress, in init+add
+         # Get requests from the waiting queue to a new prefill batch
+         for req in self.waiting_queue:
++            _scan[0] += 1
+             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
++                _scan[1] += 1
+                 continue
+ 
+             running_bs = len(running_batch.reqs)
+@@ -3436,18 +3440,23 @@ class Scheduler(
+                     not self.enable_priority_preemption
+                     or not adder.preempt_to_schedule(req, self.server_args)
+                 ):
++                    _scan[3] = "break:batch_is_full"
+                     break
+ 
+             if self.enable_hicache_storage:
++                _t0 = time.perf_counter()
+                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
++                _t[0] += time.perf_counter() - _t0
+                 if not prefetch_done:
+                     # skip staging requests that are ongoing prefetch
++                    _scan[2] += 1
+                     continue
+                 # Pop the number of tokens loaded from storage (L3 hits)
+                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                 if loaded_tokens > 0:
+                     req.storage_hit_length = loaded_tokens
+ 
++            _t1 = time.perf_counter()
+             req.init_next_round_input(self.tree_cache)
+             if self.enable_hicache_storage and self.tree_cache.holds_staged_prefetch:
+                 # Buffer mode and layerwise streaming: surface a staged
+@@ -3469,6 +3478,7 @@ class Scheduler(
+                 has_chunked_req=(self.chunked_req is not None),
+                 truncation_align_size=self.truncation_align_size,
+             )
++            _t[1] += time.perf_counter() - _t1
+ 
+             if self.enable_lora:
+                 running_loras.add(req.lora_id)
+@@ -3499,8 +3509,18 @@ class Scheduler(
+                             req.mamba_pool_idx.unsqueeze(-1)
+                         )
+                         req.mamba_pool_idx = None
++                _scan[3] = f"break:add_one_req={res.name}"
+                 break
+ 
++        if len(self.waiting_queue) > 0:
++            logger.info(
++                "scan: queued=%d visited=%d skip_prefetch=%d added=%d stop=%s "
++                "check_ms=%.1f add_ms=%.1f",
++                len(self.waiting_queue), _scan[0], _scan[2],
++                len(adder.can_run_list), _scan[3],
++                _t[0] * 1e3, _t[1] * 1e3,
++            )
++
+         if mamba_allocator is not None:
+             mamba_allocator.alloc_group_end()
+ 
