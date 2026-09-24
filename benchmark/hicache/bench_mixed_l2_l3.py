@@ -39,6 +39,11 @@ ARM_SPEC = {
     "l3_all": ("l3_nixl", 1.0),
     "mixed_aio": ("l3_fused", 0.5),
     "mixed_nixl": ("l3_nixl", 0.5),
+    # Whole-prefix reads instead of the streaming pipeline. Stages A and B are
+    # the same code, but this mode is not gated on --disable-overlap-schedule,
+    # so it is the only way to ask what overlap scheduling would buy a mixed
+    # batch without first lifting that gate.
+    "mixed_nopipe": ("l3_nopipe", 0.5),
 }
 # Older spelling, kept so earlier command lines still resolve.
 ARM_SPEC["l2_only"] = ARM_SPEC["l2_no_l3"]

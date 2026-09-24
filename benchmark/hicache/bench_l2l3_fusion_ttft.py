@@ -346,7 +346,11 @@ def base_args(args, port: int) -> list[str]:
         "disabled",
         "--cuda-graph-backend-prefill",
         "disabled",
-        "--disable-overlap-schedule",
+        # Overlap scheduling plans and submits the next batch while the GPU is
+        # still on the current one, so the prefetch's scheduler-thread work
+        # stops waiting for a forward to end. Off by default here: every
+        # earlier stage timing was taken with it off.
+        *([] if args.overlap_schedule else ["--disable-overlap-schedule"]),
         # The installed flashinfer is older than this checkout expects and its
         # autotuner import fails during FP8 warmup. Autotuning only picks kernel
         # variants, so skipping it costs throughput and nothing in correctness.
@@ -1127,6 +1131,12 @@ def parse_args():
     p.add_argument("--arms", default="l1,l2,l3_old,l3_nopipe,l3_fused,l2_fused")
     p.add_argument(
         "--nixl-plugin", default="POSIX", help="NIXL plugin for the l3_nixl server"
+    )
+    p.add_argument(
+        "--overlap-schedule",
+        action="store_true",
+        help="keep overlap scheduling on; disabled by default so stage "
+        "timings stay comparable with earlier runs",
     )
     p.add_argument(
         "--hit-tokens",
