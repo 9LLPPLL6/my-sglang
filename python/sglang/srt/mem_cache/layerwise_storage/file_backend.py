@@ -18,7 +18,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, NamedTuple, Optional
+from typing import Any, NamedTuple, Optional, Sequence
 
 from sglang.srt.mem_cache.layerwise_storage.aio_engine import (
     AlignedBuffer,
@@ -120,8 +120,12 @@ class _Shard:
     deep the queue is.
     """
 
-    def __init__(self, *, queue_depth: int):
-        self.context = LinuxAioContext(queue_depth=queue_depth)
+    def __init__(self, *, queue_depth: int, make_context=None):
+        self.context = (
+            LinuxAioContext(queue_depth=queue_depth)
+            if make_context is None
+            else make_context(queue_depth)
+        )
         self.arbiter = IoArbiter(context=self.context)
         self.wake = threading.Event()
         self.thread: Optional[threading.Thread] = None
@@ -177,6 +181,9 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
         fd_cache_capacity: int = 1024,
         alignment_profile: Optional[AlignmentProfile] = None,
         require_direct_io: bool = True,
+        engine: str = "aio",
+        nixl_plugin: str = "POSIX",
+        pinned_regions: Sequence[tuple[int, int]] = (),
     ):
         self.root = os.path.abspath(root)
         self.identity = identity
@@ -190,8 +197,24 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
             )
 
         self._io_threads = max(1, io_threads)
+        self.engine = engine
+        make_context = None
+        if engine == "nixl":
+            from sglang.srt.mem_cache.layerwise_storage.nixl_engine import NixlIoContext
+
+            def make_context(depth: int, _index=itertools.count()):
+                return NixlIoContext(
+                    queue_depth=depth,
+                    plugin=nixl_plugin,
+                    agent_name=f"sglang-layerwise-{os.getpid()}-{next(_index)}",
+                    pinned_regions=pinned_regions,
+                )
+
+        elif engine != "aio":
+            raise ValueError(f"unknown layerwise engine {engine!r}")
         self._shards = [
-            _Shard(queue_depth=queue_depth) for _ in range(self._io_threads)
+            _Shard(queue_depth=queue_depth, make_context=make_context)
+            for _ in range(self._io_threads)
         ]
         self._stop = threading.Event()
         self._files = DirectIOFileCache(capacity=fd_cache_capacity)
@@ -223,8 +246,9 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
                 )
                 shard.thread.start()
         logger.info(
-            "LayerwiseFileBackend at %s: io_threads=%d queue_depth=%d",
+            "LayerwiseFileBackend at %s: engine=%s io_threads=%d queue_depth=%d",
             self.root,
+            engine,
             self._io_threads,
             queue_depth,
         )
@@ -408,6 +432,7 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
         # pulls in the metrics collector and forward-batch types, which a
         # storage backend has no business importing on the way up.
         from sglang.srt.observability.req_time_stats import convert_time_to_realtime
+
         shards = ",".join(
             f"{index}:{state.shard_bytes.get(index, 0)}"
             for index in range(self._io_threads)

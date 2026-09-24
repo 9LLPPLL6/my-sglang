@@ -139,6 +139,19 @@ class LayerwiseStorageController:
             slow_fallback=server_args.hicache_storage_slow_fallback,
         )
         identity = backend.layout.identity
+        # NIXL transfers only touch memory it has registered. The host KV pool
+        # is the one region every extent lands in, so it is registered once and
+        # the submit path never registers again.
+        pinned_regions = (
+            (
+                host_pool.k_buffer.data_ptr(),
+                host_pool.k_buffer.numel() * host_pool.k_buffer.element_size(),
+            ),
+            (
+                host_pool.v_buffer.data_ptr(),
+                host_pool.v_buffer.numel() * host_pool.v_buffer.element_size(),
+            ),
+        )
         reader = LayerwiseFileBackend(
             root=backend.root,
             identity=identity,
@@ -146,6 +159,9 @@ class LayerwiseStorageController:
             io_threads=config.io_threads,
             alignment_profile=backend.alignment_profile,
             require_direct_io=backend.require_direct_io,
+            engine=server_args.hicache_storage_layerwise_engine,
+            nixl_plugin=server_args.hicache_storage_layerwise_nixl_plugin,
+            pinned_regions=pinned_regions,
         )
         # Cross-rank agreement happens once, at admission, in the radix bridge
         # and off the forward path. Per-group collectives inside a forward would

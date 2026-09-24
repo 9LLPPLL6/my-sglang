@@ -2923,6 +2923,25 @@ class ServerArgs:
         "it.",
         NS("memory"),
     ] = 1
+    hicache_storage_layerwise_engine: A[
+        str,
+        Arg(
+            help=(
+                "I/O engine the layerwise_file backend uses for range reads. "
+                "'aio' submits through Linux AIO. 'nixl' routes the same "
+                "extents through a NIXL plugin instead, which requires the "
+                "`nixl` package; sharding, priorities and bounce buffers are "
+                "unchanged, so the two differ only in transport."
+            ),
+            choices=["aio", "nixl"],
+        ),
+        NS("memory"),
+    ] = "aio"
+    hicache_storage_layerwise_nixl_plugin: A[
+        str,
+        "NIXL plugin used when --hicache-storage-layerwise-engine=nixl.",
+        NS("memory"),
+    ] = "POSIX"
     hicache_storage_backend_extra_config: A[
         Optional[str],
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
@@ -8275,6 +8294,11 @@ class ServerArgs:
                 "--hicache-storage-admission-budget-ms must be >= 0 (zero "
                 "disables the performance gate), got "
                 f"{cfg.hicache_storage_admission_budget_ms}."
+            )
+        if cfg.hicache_storage_layerwise_engine not in ("aio", "nixl"):
+            raise ValueError(
+                "--hicache-storage-layerwise-engine must be 'aio' or 'nixl', got "
+                f"{cfg.hicache_storage_layerwise_engine!r}."
             )
         if cfg.hicache_storage_slow_fallback not in ("full_wait", "recompute"):
             raise ValueError(
