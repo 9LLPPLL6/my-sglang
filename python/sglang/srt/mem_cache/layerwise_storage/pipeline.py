@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.layerwise_storage.types import (
 
 logger = logging.getLogger(__name__)
 
+
 _ADMISSION_PRIORITY = 0
 _READ_AHEAD_PRIORITY = 2
 
@@ -176,6 +177,10 @@ class LayerwiseStoragePipeline:
         transaction.machine.advance(TransactionState.HOST_PRIVATE_ALLOCATED)
         transaction.machine.advance(TransactionState.READING_GROUP0)
         self._submit_group(transaction, group_id=0, priority=_ADMISSION_PRIORITY)
+        self._submit_read_ahead(transaction)
+        return transaction
+
+    def _submit_read_ahead(self, transaction: LayerwiseTransaction) -> None:
         while transaction.next_submit_group_id < transaction.group_count:
             self._submit_group(
                 transaction,
@@ -183,7 +188,6 @@ class LayerwiseStoragePipeline:
                 priority=_READ_AHEAD_PRIORITY,
             )
         transaction.mark("rest_submitted")
-        return transaction
 
     def advance(self, transaction: LayerwiseTransaction) -> None:
         """One non-blocking step: drain completions, agree, hand off to H2D.

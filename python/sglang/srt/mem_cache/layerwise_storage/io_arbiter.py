@@ -71,6 +71,7 @@ class IoArbiter:
         admission_reserved_slots: int = 2,
         write_share: float = 0.25,
         write_aging_s: float = 0.5,
+        defer_read_ahead: bool = True,
     ):
         if not 0.0 < write_share <= 1.0:
             raise ValueError(f"write_share must be in (0, 1], got {write_share}")
@@ -83,12 +84,22 @@ class IoArbiter:
         )
         self.write_share = write_share
         self.write_aging_s = write_aging_s
+        # Reserving slots keeps admission I/O out of our own queue's way, but
+        # once both are submitted they share the kernel's, which knows nothing
+        # about the priorities. Group 0 is 1/10 of a prefix and the read-ahead
+        # behind it is the other 9/10, so letting them go together cost group 0
+        # 18.9 ms where alone it takes 7.1. Holding the read-ahead until the
+        # admission reads drain costs the whole read ~7 ms, which the forward
+        # hides, and is released by the completing worker's own pump, so the
+        # device never idles waiting for the scheduler to notice.
+        self.defer_read_ahead = defer_read_ahead
 
         self._lock = threading.Lock()
         self._queues = {priority: deque() for priority in IoPriority}
         self._inflight_nbytes = 0
         self._inflight_writes = 0
-        self._inflight_by_id: dict[int, tuple[int, bool]] = {}
+        self._inflight_by_id: dict[int, tuple[int, bool, IoPriority]] = {}
+        self._inflight_admission = 0
         self._submitted = 0
         self._completed = 0
 
@@ -118,6 +129,42 @@ class IoArbiter:
         with self._lock:
             self._queues[priority].append(item)
 
+    def enqueue_many(
+        self,
+        items,
+        *,
+        priority: IoPriority,
+        is_write: bool = False,
+    ) -> None:
+        """Queue a whole group under one lock.
+
+        A layer group expands into one extent per page per KV part -- 640 of
+        them for a 32-page prefix at `group_size` 8 -- and taking the queue lock
+        once per extent was measured at a third of the submit cost. Every item
+        in a group carries the same priority, so nothing is lost by batching.
+        """
+        now = time.monotonic()
+        queued = []
+        for fd, ptr, nbytes, offset, user_data in items:
+            if nbytes <= 0:
+                raise ValueError(f"nbytes must be positive, got {nbytes}")
+            queued.append(
+                _QueuedIo(
+                    fd=fd,
+                    ptr=ptr,
+                    nbytes=nbytes,
+                    offset=offset,
+                    user_data=user_data,
+                    priority=priority,
+                    is_write=is_write,
+                    enqueued_at=now,
+                )
+            )
+        if not queued:
+            return
+        with self._lock:
+            self._queues[priority].extend(queued)
+
     def pump(self) -> int:
         """Submit as many queued operations as the current budget allows."""
         reads, writes = self._take_submittable()
@@ -134,12 +181,14 @@ class IoArbiter:
         if completions:
             with self._lock:
                 for completion in completions:
-                    nbytes, is_write = self._inflight_by_id.pop(
-                        completion.user_data, (0, False)
+                    nbytes, is_write, priority = self._inflight_by_id.pop(
+                        completion.user_data, (0, False, IoPriority.READ_AHEAD)
                     )
                     self._inflight_nbytes -= nbytes
                     if is_write:
                         self._inflight_writes -= 1
+                    if priority is IoPriority.ADMISSION:
+                        self._inflight_admission -= 1
                 self._completed += len(completions)
         self.pump()
         return completions
@@ -191,7 +240,12 @@ class IoArbiter:
             )
             write_slots = self._write_slot_budget_locked(read_pending=read_pending)
 
+            blocked = self.defer_read_ahead and (
+                self._inflight_admission > 0 or bool(self._queues[IoPriority.ADMISSION])
+            )
             for priority in self._submission_order_locked(now=now):
+                if blocked and priority is IoPriority.READ_AHEAD:
+                    continue
                 queue = self._queues[priority]
                 while queue and slots > 0:
                     item = queue[0]
@@ -249,10 +303,16 @@ class IoArbiter:
 
         with self._lock:
             for item in items[:accepted]:
-                self._inflight_by_id[item.user_data] = (item.nbytes, is_write)
+                self._inflight_by_id[item.user_data] = (
+                    item.nbytes,
+                    is_write,
+                    item.priority,
+                )
                 self._inflight_nbytes += item.nbytes
                 if is_write:
                     self._inflight_writes += 1
+                if item.priority is IoPriority.ADMISSION:
+                    self._inflight_admission += 1
             self._submitted += accepted
             # Anything the kernel refused goes back to the head of its own
             # queue, so back pressure never demotes an admission read.

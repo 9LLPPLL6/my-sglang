@@ -310,14 +310,13 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
             state.pending_extents += len(group.extents)
 
         io_priority = _PRIORITY_LEVELS[min(priority, len(_PRIORITY_LEVELS) - 1)]
-        for extent in group.extents:
-            self._enqueue_extent(
-                handle=handle,
-                state=state,
-                group_id=group.group_id,
-                extent=extent,
-                priority=io_priority,
-            )
+        self._enqueue_group(
+            handle=handle,
+            state=state,
+            group_id=group.group_id,
+            extents=group.extents,
+            priority=io_priority,
+        )
         self._wake_or_pump()
         return LayerwiseGroupTicket(
             handle=handle, group_id=group.group_id, backend_token=None
@@ -483,71 +482,95 @@ class LayerwiseFileBackend(LayerwiseStorageBackend):
             raise KeyError(f"unknown transaction {handle.transaction_id!r}")
         return state
 
-    def _enqueue_extent(
+    def _enqueue_group(
         self,
         *,
         handle: LayerwiseReadHandle,
         state: _ReadHandleState,
         group_id: int,
-        extent: LayerwiseStorageExtent,
+        extents: tuple[LayerwiseStorageExtent, ...],
         priority: IoPriority,
     ) -> None:
-        path = self.page_path(extent.storage_key)
-        target_ptr = state.target.base_for(extent.kv_part) + extent.target_offset
+        """Queue every extent of one group, taking each lock once for the group.
+
+        A group is one extent per page per KV part, so the per-extent version
+        resolved the same 32 page paths 640 times and took the inflight lock,
+        the accounting lock and the arbiter's queue lock on each of them.
+        """
         memory_alignment = self.alignment_profile.memory_alignment
-        needs_bounce = (
-            extent.payload_offset != 0
-            or extent.payload_nbytes != extent.io_nbytes
-            or target_ptr % memory_alignment != 0
-        )
-        open_started = time.perf_counter_ns()
-        try:
-            fd = self._files.acquire(
-                path, direct=self.alignment_profile.direct_io_available
+        direct = self.alignment_profile.direct_io_available
+
+        # One fd per page key, not one per extent: K and V of the same page,
+        # and every later group, all read the same file.
+        open_ns = 0
+        opened: dict[str, tuple[int, str]] = {}
+        records: dict[int, _InflightExtent] = {}
+        by_shard: dict[int, list] = {}
+        for extent in extents:
+            page_key = extent.storage_key
+            entry = opened.get(page_key)
+            if entry is None:
+                path = self.page_path(page_key)
+                _open_started = time.perf_counter_ns()
+                try:
+                    fd = self._files.acquire(path, direct=direct)
+                except OSError as error:
+                    self._record_completion(
+                        state=state,
+                        transaction_id=handle.transaction_id,
+                        generation=handle.generation,
+                        group_id=group_id,
+                        extent_id=extent.extent_id,
+                        status=ExtentCompletionStatus.FAILED,
+                        error=f"open failed: {error}",
+                    )
+                    continue
+                finally:
+                    open_ns += time.perf_counter_ns() - _open_started
+                entry = opened[page_key] = (fd, path)
+            fd, path = entry
+
+            target_ptr = state.target.base_for(extent.kv_part) + extent.target_offset
+            needs_bounce = (
+                extent.payload_offset != 0
+                or extent.payload_nbytes != extent.io_nbytes
+                or target_ptr % memory_alignment != 0
             )
-        except OSError as error:
-            self._record_completion(
-                state=state,
+            bounce = self._bounce.acquire(extent.io_nbytes) if needs_bounce else None
+            user_data = next(self._user_data)
+            records[user_data] = _InflightExtent(
                 transaction_id=handle.transaction_id,
+                page_key=page_key,
                 generation=handle.generation,
                 group_id=group_id,
                 extent_id=extent.extent_id,
-                status=ExtentCompletionStatus.FAILED,
-                error=f"open failed: {error}",
+                path=path,
+                io_nbytes=extent.io_nbytes,
+                bounce=bounce,
+                bounce_src_offset=extent.payload_offset,
+                payload_nbytes=extent.payload_nbytes,
+                target_ptr=target_ptr,
             )
-            return
+            shard_index = state.shard_of_page.get(page_key, 0)
+            by_shard.setdefault(shard_index, []).append(
+                (
+                    fd,
+                    bounce.ptr if bounce is not None else target_ptr,
+                    extent.io_nbytes,
+                    extent.io_offset,
+                    user_data,
+                )
+            )
 
-        bounce = self._bounce.acquire(extent.io_nbytes) if needs_bounce else None
-        user_data = next(self._user_data)
-        record = _InflightExtent(
-            transaction_id=handle.transaction_id,
-            page_key=extent.storage_key,
-            generation=handle.generation,
-            group_id=group_id,
-            extent_id=extent.extent_id,
-            path=path,
-            io_nbytes=extent.io_nbytes,
-            bounce=bounce,
-            bounce_src_offset=extent.payload_offset,
-            payload_nbytes=extent.payload_nbytes,
-            target_ptr=target_ptr,
-        )
+        if not records:
+            return
         with self._lock:
-            self._inflight[user_data] = record
-        shard_index = state.shard_of_page.get(extent.storage_key, 0)
-        with self._lock:
-            state.open_ns += time.perf_counter_ns() - open_started
+            self._inflight.update(records)
+            state.open_ns += open_ns
             if state.first_submit_s == 0.0:
                 state.first_submit_s = time.perf_counter()
-        shard = self._shards[shard_index]
-        shard.arbiter.enqueue(
-            fd=fd,
-            ptr=bounce.ptr if bounce is not None else target_ptr,
-            nbytes=extent.io_nbytes,
-            offset=extent.io_offset,
-            user_data=user_data,
-            priority=priority,
-        )
+        for shard_index, items in by_shard.items():
+            self._shards[shard_index].arbiter.enqueue_many(items, priority=priority)
 
     def _wake_or_pump(self) -> None:
         """Hand the new work to the shard threads, or submit it here if alone."""

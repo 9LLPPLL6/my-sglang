@@ -95,6 +95,9 @@ def build_read_plan(
         k_ptr=host_pool.k_buffer.data_ptr(), v_ptr=host_pool.v_buffer.data_ptr()
     )
 
+    # Validate once for the whole plan; every group asks about the same pages.
+    page_indices = host_pool.page_indices_for(host_indices)
+
     groups = []
     for spec in specs:
         host_plan = host_pool.get_layer_group_buffer_meta(
@@ -103,6 +106,7 @@ def build_read_plan(
             spec.layer_end,
             file_payload_offset=layout.k_offset,
             alignment=layout.alignment,
+            page_indices=page_indices,
         )
         groups.append(
             LayerGroupPlan(

@@ -196,8 +196,15 @@ class LayerwiseRadixBridge:
         staged = self._staged.get(req_id)
         if staged is None:
             return True
-        self.controller.poll()
         transaction = staged.transaction
+        # One `poll` advances every open transaction, and the scheduler asks
+        # about each waiting request in turn, so a scan of eight polled eight
+        # times to learn what the first poll had already established. Polling
+        # cannot change a verdict that is already decided, and a transaction
+        # that is streaming is pumped by the layer gate instead, so the only
+        # request that needs a fresh poll is one still waiting for group 0.
+        if not (transaction.admission_ready or transaction.aborted):
+            self.controller.poll()
 
         decided = transaction.aborted or transaction.admission_ready
         usable = transaction.admission_ready and not transaction.aborted

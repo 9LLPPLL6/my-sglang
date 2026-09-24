@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import NamedTuple, Sequence
+from typing import NamedTuple, Optional, Sequence
 
 import torch
 
@@ -832,6 +832,17 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
 
+    def page_indices_for(self, host_indices: torch.Tensor) -> list[int]:
+        """Validate a staging span once and return the pages it covers.
+
+        A read plan asks `get_layer_group_buffer_meta` about the same span once
+        per layer group; handing the result back in through `page_indices` keeps
+        that validation off the other nine calls.
+        """
+        return _validate_layer_group_host_indices(
+            host_indices, page_size=self.page_size, page_num=self.page_num
+        )
+
     def get_layer_group_buffer_meta(
         self,
         host_indices: torch.Tensor,
@@ -840,6 +851,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         *,
         file_payload_offset: int = 0,
         alignment: int = 4096,
+        page_indices: Optional[Sequence[int]] = None,
     ) -> LayerGroupBufferPlan:
         """Plan per-page K/V I/O for ``[layer_start, layer_end)``.
 
@@ -887,9 +899,14 @@ class MHATokenToKVPoolHost(HostKVCache):
                 f"{file_payload_offset!r}"
             )
 
-        page_indices = _validate_layer_group_host_indices(
-            host_indices, page_size=self.page_size, page_num=self.page_num
-        )
+        # A plan for one prefix asks for every layer group in turn, all against
+        # the same `host_indices`; validating them once per group re-derived the
+        # same page list ten times. `page_indices` lets a caller that already
+        # validated hand the result in.
+        if page_indices is None:
+            page_indices = _validate_layer_group_host_indices(
+                host_indices, page_size=self.page_size, page_num=self.page_num
+            )
         buffers = (("K", self.k_buffer), ("V", self.v_buffer))
         expected_prefix = (
             self.page_num,
@@ -908,33 +925,35 @@ class MHATokenToKVPoolHost(HostKVCache):
             next_file_offset += self.layer_num * layer_stride
 
         extents = []
+        total_logical_size = 0
+        direct_io_eligible = True
+        bounce_required = False
         for page_index in page_indices:
             for kv, buffer in buffers:
-                extents.append(
-                    _build_layer_group_extent(
-                        kv=kv,
-                        buffer=buffer,
-                        page_index=page_index,
-                        layer_start=layer_start,
-                        layer_end=layer_end,
-                        file_region_offset=file_region_offsets[kv],
-                        alignment=alignment,
-                    )
+                extent = _build_layer_group_extent(
+                    kv=kv,
+                    buffer=buffer,
+                    page_index=page_index,
+                    layer_start=layer_start,
+                    layer_end=layer_end,
+                    file_region_offset=file_region_offsets[kv],
+                    alignment=alignment,
                 )
+                extents.append(extent)
+                total_logical_size += extent.logical_size
+                direct_io_eligible &= extent.direct_io_eligible
+                bounce_required |= extent.bounce_required
 
         extent_tuple = tuple(extents)
-        direct_io_eligible = bool(extent_tuple) and all(
-            extent.direct_io_eligible for extent in extent_tuple
-        )
         return LayerGroupBufferPlan(
             layer_start=layer_start,
             layer_end=layer_end,
             alignment=alignment,
             file_payload_offset=file_payload_offset,
             extents=extent_tuple,
-            total_logical_size=sum(extent.logical_size for extent in extent_tuple),
-            direct_io_eligible=direct_io_eligible,
-            bounce_required=any(extent.bounce_required for extent in extent_tuple),
+            total_logical_size=total_logical_size,
+            direct_io_eligible=bool(extent_tuple) and direct_io_eligible,
+            bounce_required=bounce_required,
         )
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
